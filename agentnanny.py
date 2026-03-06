@@ -969,18 +969,68 @@ def show_status():
         print(f"Session policies: {len(policies)} active")
 
 
-def show_log():
-    """Tail the audit log."""
+def show_log(
+    lines_count: int = 50,
+    output_format: str = "raw",
+    filter_tool: str | None = None,
+    filter_action: str | None = None,
+) -> None:
+    """Show the audit log with optional filtering and formatting."""
     cfg = load_config()
     log_path = cfg.get("logging", {}).get("audit_log", "/tmp/agentnanny.log")
     if not Path(log_path).exists():
         print(f"No log file at {log_path}")
         return
     with open(log_path, encoding="utf-8") as f:
-        lines = f.readlines()
-    # Show last 50 lines
-    for line in lines[-50:]:
-        print(line, end="")
+        raw_lines = f.readlines()
+
+    # Parse TSV lines into structured records
+    records: list[dict[str, str]] = []
+    for line in raw_lines:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        record = {
+            "timestamp": parts[0],
+            "source": parts[1],
+            "action": parts[2],
+            "tool_name": parts[3],
+            "detail": parts[4],
+        }
+        if filter_tool and record["tool_name"] != filter_tool:
+            continue
+        if filter_action and record["action"] != filter_action:
+            continue
+        records.append(record)
+
+    # Limit to last N records
+    records = records[-lines_count:]
+
+    if not records:
+        print("No matching log entries.")
+        return
+
+    if output_format == "json":
+        print(json.dumps(records, indent=2))
+    elif output_format == "table":
+        headers = ["TIMESTAMP", "SOURCE", "ACTION", "TOOL", "DETAIL"]
+        keys = ["timestamp", "source", "action", "tool_name", "detail"]
+        col_widths = [len(h) for h in headers]
+        for rec in records:
+            for i, key in enumerate(keys):
+                col_widths[i] = max(col_widths[i], len(rec[key]))
+        fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
+        print(fmt.format(*headers))
+        print(fmt.format(*("-" * w for w in col_widths)))
+        for rec in records:
+            print(fmt.format(*(rec[k] for k in keys)))
+    else:
+        # raw: original TSV lines
+        for rec in records:
+            print("\t".join(rec[k] for k in ["timestamp", "source", "action", "tool_name", "detail"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1209,7 +1259,11 @@ def main():
     sub.add_parser("stop", help="Stop tmux daemon")
     sub.add_parser("init", help="Create .agentnanny.toml in current directory")
     sub.add_parser("status", help="Show hook + daemon status")
-    sub.add_parser("log", help="Tail audit log")
+    p_log = sub.add_parser("log", help="Tail audit log")
+    p_log.add_argument("--lines", "-n", type=int, default=50, help="Number of lines to show (default: 50)")
+    p_log.add_argument("--format", "-f", dest="log_format", choices=["raw", "json", "table"], default="raw", help="Output format (default: raw)")
+    p_log.add_argument("--tool", default=None, help="Filter by tool name")
+    p_log.add_argument("--action", default=None, help="Filter by action")
 
     p_activate = sub.add_parser("activate", help="Create a session policy (prints export command)")
     p_activate.add_argument("profile", nargs="?", default=None, help="Profile name (e.g. safe-dev)")
@@ -1251,7 +1305,12 @@ def main():
     elif args.command == "status":
         show_status()
     elif args.command == "log":
-        show_log()
+        show_log(
+            lines_count=args.lines,
+            output_format=args.log_format,
+            filter_tool=args.tool,
+            filter_action=args.action,
+        )
     elif args.command == "activate":
         cmd_activate(args.profile, args.groups, args.tools, args.deny, args.ttl)
     elif args.command == "deactivate":

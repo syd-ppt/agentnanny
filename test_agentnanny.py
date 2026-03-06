@@ -1814,3 +1814,117 @@ class TestInit:
         content = (tmp_path / ".agentnanny.toml").read_text()
         result = agentnanny.parse_toml(content)
         assert "hooks" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# show_log
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+SAMPLE_LOG_LINES = [
+    "2026-01-01T00:00:00+00:00\thook\tallowed\tBash\tcommand=ls\n",
+    "2026-01-01T00:00:01+00:00\thook\tdenied\tWrite\tpath=/etc/passwd\n",
+    "2026-01-01T00:00:02+00:00\tdaemon\tapproved\tcontinue\tpane=%0\n",
+    "2026-01-01T00:00:03+00:00\thook\tallowed\tRead\tpath=foo.py\n",
+    "2026-01-01T00:00:04+00:00\thook\tdenied\tBash\tcommand=rm -rf /\n",
+]
+
+
+class TestShowLog:
+    def _write_log(self, tmp_path: Path, lines: list[str] | None = None) -> str:
+        log_file = tmp_path / "test.log"
+        log_file.write_text("".join(lines or SAMPLE_LOG_LINES), encoding="utf-8")
+        return str(log_file)
+
+    def test_raw_format(self, tmp_path, capsys):
+        log_path = self._write_log(tmp_path)
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": log_path}}):
+            agentnanny.show_log(output_format="raw")
+        out = capsys.readouterr().out
+        assert "Bash" in out
+        assert "\t" in out
+        lines = [l for l in out.strip().splitlines() if l]
+        assert len(lines) == 5
+
+    def test_json_format(self, tmp_path, capsys):
+        log_path = self._write_log(tmp_path)
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": log_path}}):
+            agentnanny.show_log(output_format="json")
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert isinstance(data, list)
+        assert len(data) == 5
+        assert data[0]["timestamp"] == "2026-01-01T00:00:00+00:00"
+        assert data[0]["source"] == "hook"
+        assert data[0]["action"] == "allowed"
+        assert data[0]["tool_name"] == "Bash"
+        assert data[0]["detail"] == "command=ls"
+
+    def test_table_format(self, tmp_path, capsys):
+        log_path = self._write_log(tmp_path)
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": log_path}}):
+            agentnanny.show_log(output_format="table")
+        out = capsys.readouterr().out
+        lines = out.strip().splitlines()
+        # Header + separator + 5 data rows
+        assert len(lines) == 7
+        assert "TIMESTAMP" in lines[0]
+        assert "SOURCE" in lines[0]
+        assert "ACTION" in lines[0]
+        assert "TOOL" in lines[0]
+        assert "DETAIL" in lines[0]
+        assert "---" in lines[1]
+
+    def test_filter_by_tool(self, tmp_path, capsys):
+        log_path = self._write_log(tmp_path)
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": log_path}}):
+            agentnanny.show_log(output_format="json", filter_tool="Bash")
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert len(data) == 2
+        assert all(r["tool_name"] == "Bash" for r in data)
+
+    def test_filter_by_action(self, tmp_path, capsys):
+        log_path = self._write_log(tmp_path)
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": log_path}}):
+            agentnanny.show_log(output_format="json", filter_action="denied")
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert len(data) == 2
+        assert all(r["action"] == "denied" for r in data)
+
+    def test_combined_filters(self, tmp_path, capsys):
+        log_path = self._write_log(tmp_path)
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": log_path}}):
+            agentnanny.show_log(output_format="json", filter_tool="Bash", filter_action="denied")
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert len(data) == 1
+        assert data[0]["tool_name"] == "Bash"
+        assert data[0]["action"] == "denied"
+
+    def test_lines_limit(self, tmp_path, capsys):
+        log_path = self._write_log(tmp_path)
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": log_path}}):
+            agentnanny.show_log(lines_count=2, output_format="json")
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert len(data) == 2
+        # Should be the last 2 entries
+        assert data[0]["tool_name"] == "Read"
+        assert data[1]["tool_name"] == "Bash"
+
+    def test_empty_log(self, tmp_path, capsys):
+        # Missing log file
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": str(tmp_path / "nonexistent.log")}}):
+            agentnanny.show_log()
+        out = capsys.readouterr().out
+        assert "No log file" in out
+
+        # Empty log file
+        empty_log = tmp_path / "empty.log"
+        empty_log.write_text("", encoding="utf-8")
+        with patch.object(agentnanny, "load_config", return_value={"logging": {"audit_log": str(empty_log)}}):
+            agentnanny.show_log()
+        out = capsys.readouterr().out
+        assert "No matching log entries" in out
