@@ -304,6 +304,36 @@ def matches_allow(tool_name: str, tool_input: dict, allow_patterns: list[str]) -
 # ---------------------------------------------------------------------------
 
 
+LOG_MAX_SIZE_DEFAULT = 10 * 1024 * 1024  # 10 MB
+LOG_BACKUP_COUNT_DEFAULT = 3
+
+
+def _rotate_log(log_file: Path, cfg: dict) -> None:
+    """Rotate audit log when it exceeds max size."""
+    log_cfg = cfg.get("logging", {})
+    max_size = int(log_cfg.get("max_size_bytes", LOG_MAX_SIZE_DEFAULT))
+    backup_count = int(log_cfg.get("backup_count", LOG_BACKUP_COUNT_DEFAULT))
+
+    if not log_file.exists():
+        return
+    try:
+        if log_file.stat().st_size < max_size:
+            return
+    except OSError:
+        return
+
+    # Rotate: .log.3 → delete, .log.2 → .log.3, .log.1 → .log.2, .log → .log.1
+    for i in range(backup_count, 0, -1):
+        src = log_file.with_suffix(f".log.{i}") if i > 0 else log_file
+        dst = log_file.with_suffix(f".log.{i + 1}")
+        if i == backup_count:
+            src.unlink(missing_ok=True)
+        elif src.exists():
+            src.rename(dst)
+    if log_file.exists():
+        log_file.rename(log_file.with_suffix(f".log.1"))
+
+
 def audit_log(source: str, action: str, tool_name: str, detail: str, cfg: dict | None = None):
     """Append a TSV line to the audit log."""
     cfg = cfg or load_config()
@@ -317,7 +347,9 @@ def audit_log(source: str, action: str, tool_name: str, detail: str, cfg: dict |
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     line = f"{ts}\t{source}\t{action}\t{tool_name}\t{detail}\n"
     try:
-        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        log_file = Path(log_path)
+        _rotate_log(log_file, cfg)
+        fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.write(fd, line.encode("utf-8"))
         finally:

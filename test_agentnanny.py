@@ -1568,3 +1568,44 @@ class TestAllowWithAlternation:
         assert agentnanny.matches_allow(
             "Bash", {"command": "git push"}, ["Bash(git status*|git diff*)"]
         ) is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Log rotation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestLogRotation:
+    def test_rotation_when_exceeds_size(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        log_file.write_text("x" * 200)
+        cfg = {"logging": {"max_size_bytes": 100, "backup_count": 2}}
+        agentnanny._rotate_log(log_file, cfg)
+        assert not log_file.exists()
+        assert (tmp_path / "test.log.1").exists()
+
+    def test_no_rotation_under_size(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        log_file.write_text("x" * 50)
+        cfg = {"logging": {"max_size_bytes": 100, "backup_count": 2}}
+        agentnanny._rotate_log(log_file, cfg)
+        assert log_file.exists()
+        assert not (tmp_path / "test.log.1").exists()
+
+    def test_rotation_cascades(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        log_file.write_text("current")
+        (tmp_path / "test.log.1").write_text("old1")
+        cfg = {"logging": {"max_size_bytes": 1, "backup_count": 3}}
+        agentnanny._rotate_log(log_file, cfg)
+        assert (tmp_path / "test.log.2").read_text() == "old1"
+        assert (tmp_path / "test.log.1").read_text() == "current"
+
+    def test_rotation_deletes_oldest(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        log_file.write_text("current")
+        (tmp_path / "test.log.1").write_text("old1")
+        (tmp_path / "test.log.2").write_text("old2")
+        cfg = {"logging": {"max_size_bytes": 1, "backup_count": 2}}
+        agentnanny._rotate_log(log_file, cfg)
+        assert not (tmp_path / "test.log.2").read_text() == "old2"

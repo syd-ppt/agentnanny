@@ -223,6 +223,8 @@ dry_run = false             # log without sending keystrokes
 [logging]
 audit_log = "/tmp/agentnanny.log"
 level = "actions"           # "actions" or "all"
+max_size_bytes = 10485760   # 10 MB — rotates when exceeded
+backup_count = 3            # keep .log.1, .log.2, .log.3
 ```
 
 ### Environment variables
