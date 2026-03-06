@@ -1461,7 +1461,7 @@ def cmd_explain(scope_id: str | None):
         groups_cfg = cfg.get("groups", {})
         for g in groups:
             patterns = groups_cfg.get(g, [])
-            print(f"  {g} → {', '.join(patterns)}")
+            print(f"  {g} -> {', '.join(patterns)}")
     print(f"Tools: {tools_str}")
     print(f"Deny: {deny_str}")
 

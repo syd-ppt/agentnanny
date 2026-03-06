@@ -2374,7 +2374,7 @@ class TestExplain:
             agentnanny.cmd_explain(scope_id)
         out = capsys.readouterr().out
         # Should show expanded patterns for the filesystem group
-        assert "filesystem →" in out
+        assert "filesystem ->" in out
         assert "Read" in out
         assert "Write" in out
         assert "Edit" in out
