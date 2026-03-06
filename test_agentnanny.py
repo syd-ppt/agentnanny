@@ -1469,3 +1469,37 @@ class TestParseTtl:
 
     def test_zero(self):
         assert agentnanny._parse_ttl("0") == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File permissions
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestFilePermissions:
+    def test_session_file_is_owner_only(self, tmp_path):
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path):
+            path = agentnanny.save_session_policy({
+                "scope_id": "perm1234",
+                "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "ttl_seconds": 0,
+                "allow_groups": [],
+                "allow_tools": [],
+                "deny": [],
+            })
+        mode = path.stat().st_mode
+        assert mode & 0o777 == 0o600
+
+    def test_session_dir_is_owner_only(self, tmp_path):
+        session_dir = tmp_path / "sessions"
+        with patch.object(agentnanny, "SESSION_DIR", session_dir):
+            agentnanny.save_session_policy({
+                "scope_id": "perm5678",
+                "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "ttl_seconds": 0,
+                "allow_groups": [],
+                "allow_tools": [],
+                "deny": [],
+            })
+        mode = session_dir.stat().st_mode
+        assert mode & 0o777 == 0o700

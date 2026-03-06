@@ -8,6 +8,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -169,12 +170,19 @@ def generate_scope_id() -> str:
     return os.urandom(4).hex()
 
 
+def _secure_dir(path: Path) -> None:
+    """Ensure directory exists with owner-only permissions (700)."""
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(stat.S_IRWXU)
+
+
 def save_session_policy(policy: dict) -> Path:
     """Write a session policy file. Returns the path."""
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_dir(SESSION_DIR)
     path = SESSION_DIR / f"{policy['scope_id']}.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(policy, indent=2), encoding="utf-8")
+    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)  # 600
     tmp.replace(path)
     return path
 
@@ -297,8 +305,11 @@ def audit_log(source: str, action: str, tool_name: str, detail: str, cfg: dict |
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     line = f"{ts}\t{source}\t{action}\t{tool_name}\t{detail}\n"
     try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(line)
+        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
     except OSError:
         pass  # Log failure is not fatal
 
