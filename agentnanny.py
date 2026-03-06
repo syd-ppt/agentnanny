@@ -169,6 +169,7 @@ def load_config() -> dict:
         "hooks": {},
         "daemon": {},
         "logging": {},
+        "context": {},
         "groups": dict(BUILTIN_GROUPS),
         "profiles": {k: dict(v) for k, v in BUILTIN_PROFILES.items()},
     }
@@ -514,6 +515,43 @@ def handle_hook():
     return
 
 
+def handle_post_hook():
+    """PostToolUse hook handler. Monitors context pressure."""
+    event = json.load(sys.stdin)
+    tool_name = event.get("tool_name", "")
+    tool_input = event.get("tool_input", {})
+
+    cfg = load_config()
+    detail = _primary_input(tool_name, tool_input)[:200]
+    audit_log("hook", "executed", tool_name, detail, cfg)
+
+    status_path = Path.home() / ".claude" / "status.json"
+    if not status_path.exists():
+        return
+
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+
+    context_percent = status.get("contextPercent")
+    if context_percent is None:
+        return
+
+    ctx_cfg = cfg.get("context", {})
+    critical = ctx_cfg.get("critical_percent", 75)
+    warn = ctx_cfg.get("warn_percent", 60)
+
+    message: str | None = None
+    if context_percent >= critical:
+        message = f"agentnanny: CRITICAL — context {context_percent}% full. Summarize and compact immediately."
+    elif context_percent >= warn:
+        message = f"agentnanny: WARNING — context {context_percent}% full. Consider summarizing soon."
+
+    if message is not None:
+        json.dump({"hookSpecificOutput": {"message": message}}, sys.stdout)
+
+
 # ---------------------------------------------------------------------------
 # Mode 2: Install / Uninstall hooks
 # ---------------------------------------------------------------------------
@@ -555,8 +593,21 @@ def install_hooks():
     }
 
     perm_hooks.append(hook_entry)
+
+    # Register PostToolUse hook for context pressure monitoring
+    post_hooks: list = hooks.setdefault("PostToolUse", [])
+    post_hook_entry = {
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": f'"{python_cmd}" "{script_path}" post-hook',
+        }],
+    }
+    post_hooks.append(post_hook_entry)
+
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     print(f"Installed PermissionRequest hook in {SETTINGS_PATH}")
+    print(f"Installed PostToolUse hook in {SETTINGS_PATH}")
 
 
 def uninstall_hooks():
@@ -569,7 +620,7 @@ def uninstall_hooks():
     hooks = settings.get("hooks", {})
     modified = False
 
-    for event_name in ("PermissionRequest", "PreToolUse"):
+    for event_name in ("PermissionRequest", "PreToolUse", "PostToolUse"):
         entries: list = hooks.get(event_name, [])
         filtered = []
         for entry in entries:
@@ -1197,6 +1248,7 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("hook", help="Hook handler (called by Claude Code, not user)")
+    sub.add_parser("post-hook", help="PostToolUse hook handler (called by Claude Code, not user)")
     sub.add_parser("install", help="Register hooks in ~/.claude/settings.json")
     sub.add_parser("uninstall", help="Remove hooks from ~/.claude/settings.json")
 
@@ -1236,6 +1288,8 @@ def main():
 
     if args.command == "hook":
         handle_hook()
+    elif args.command == "post-hook":
+        handle_post_hook()
     elif args.command == "install":
         install_hooks()
     elif args.command == "uninstall":

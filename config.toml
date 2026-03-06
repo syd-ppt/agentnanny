@@ -64,6 +64,11 @@ deny = []
 # deny   = ["Bash(rm -rf*)"]
 # ttl    = "4h"
 
+[context]
+# Context window pressure thresholds (percentage)
+warn_percent = 60
+critical_percent = 75
+
 [daemon]
 session = "claude"
 poll_interval = 0.3
