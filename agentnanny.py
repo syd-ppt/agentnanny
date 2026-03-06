@@ -1149,6 +1149,63 @@ def cmd_init():
     print(f"Created {target}")
 
 
+def cmd_list_groups():
+    """List all configured groups (builtin + config)."""
+    cfg = load_config()
+    groups = cfg.get("groups", {})
+    if not groups:
+        print("No groups configured")
+        return
+    max_name = max(len(n) for n in groups)
+    for name in sorted(groups):
+        patterns = ", ".join(groups[name])
+        print(f"  {name:<{max_name}}  {patterns}")
+
+
+def cmd_explain(scope_id: str | None):
+    """Inspect a session policy in detail."""
+    if scope_id is None:
+        scope_id = os.environ.get("AGENTNANNY_SCOPE")
+    if not scope_id:
+        print("No scope ID provided and AGENTNANNY_SCOPE not set", file=sys.stderr)
+        raise SystemExit(1)
+
+    policy = load_session_policy(scope_id)
+    if policy is None:
+        print(f"No active session for scope: {scope_id}", file=sys.stderr)
+        raise SystemExit(1)
+
+    cfg = load_config()
+    created = datetime.fromisoformat(policy["created"])
+    ttl = policy.get("ttl_seconds", 0)
+    groups = policy.get("allow_groups", [])
+    tools = policy.get("allow_tools", [])
+    deny = policy.get("deny", [])
+
+    print(f"Session: {scope_id}")
+    print(f"Created: {policy['created']}")
+
+    if ttl:
+        elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+        remaining = max(0, int(ttl - elapsed))
+        print(f"TTL: {ttl}s ({remaining}s remaining)")
+    else:
+        print("TTL: none")
+
+    groups_str = ", ".join(groups) if groups else "-"
+    tools_str = ", ".join(tools) if tools else "-"
+    deny_str = ", ".join(deny) if deny else "-"
+
+    print(f"Groups: {groups_str}")
+    if groups:
+        groups_cfg = cfg.get("groups", {})
+        for g in groups:
+            patterns = groups_cfg.get(g, [])
+            print(f"  {g} → {', '.join(patterns)}")
+    print(f"Tools: {tools_str}")
+    print(f"Deny: {deny_str}")
+
+
 def cmd_list_profiles():
     """List all available profiles (builtin + config)."""
     cfg = load_config()
@@ -1231,6 +1288,10 @@ def main():
 
     sub.add_parser("profiles", help="List available profiles")
     sub.add_parser("sessions", help="List active session policies")
+    sub.add_parser("list-groups", help="List all configured groups")
+
+    p_explain = sub.add_parser("explain", help="Inspect a session policy in detail")
+    p_explain.add_argument("scope_id", nargs="?", default=None, help="Scope ID (default: from AGENTNANNY_SCOPE)")
 
     args = parser.parse_args()
 
@@ -1262,6 +1323,10 @@ def main():
         cmd_list_profiles()
     elif args.command == "sessions":
         cmd_sessions()
+    elif args.command == "list-groups":
+        cmd_list_groups()
+    elif args.command == "explain":
+        cmd_explain(args.scope_id)
     else:
         parser.print_help()
         raise SystemExit(1)
