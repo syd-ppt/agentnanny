@@ -74,3 +74,5 @@ dry_run = false
 audit_log = "/tmp/agentnanny.log"
 # "all" logs every decision, "actions" logs only allows/denies
 level = "actions"
+max_size_bytes = 10485760
+backup_count = 3

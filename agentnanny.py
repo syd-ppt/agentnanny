@@ -15,6 +15,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -173,19 +178,25 @@ def load_config() -> dict:
         "profiles": {k: dict(v) for k, v in BUILTIN_PROFILES.items()},
     }
 
+    def _load_toml(path: Path) -> dict:
+        if tomllib is not None:
+            with open(path, "rb") as fp:
+                return tomllib.load(fp)
+        return parse_toml(path.read_text(encoding="utf-8"))
+
     # Layer 1: script-adjacent config.toml (backward compat)
     if CONFIG_PATH.exists():
-        cfg = _deep_merge(cfg, parse_toml(CONFIG_PATH.read_text(encoding="utf-8")))
+        cfg = _deep_merge(cfg, _load_toml(CONFIG_PATH))
 
     # Layer 2: user config (~/.config/agentnanny/config.toml or %APPDATA%)
     user_path = _user_config_path()
     if user_path.exists():
-        cfg = _deep_merge(cfg, parse_toml(user_path.read_text(encoding="utf-8")))
+        cfg = _deep_merge(cfg, _load_toml(user_path))
 
     # Layer 3: project config (.agentnanny.toml walking up from cwd)
     proj_path = _find_project_config()
     if proj_path is not None:
-        cfg = _deep_merge(cfg, parse_toml(proj_path.read_text(encoding="utf-8")))
+        cfg = _deep_merge(cfg, _load_toml(proj_path))
 
     # Layer 4: env var overrides
     if v := os.environ.get("AGENTNANNY_SESSION"):
@@ -198,6 +209,23 @@ def load_config() -> dict:
         cfg.setdefault("daemon", {})["dry_run"] = v.lower() in ("1", "true", "yes")
 
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Glob-to-regex conversion
+# ---------------------------------------------------------------------------
+
+
+def _glob_to_regex(pattern: str) -> str:
+    """Convert a glob pattern (with ``|`` alternation) to a regex string.
+
+    Each ``|``-separated segment is converted independently (``*`` → ``.*``,
+    ``?`` → ``.``) and the segments are joined with ``|``.
+    """
+    parts: list[str] = []
+    for segment in pattern.split("|"):
+        parts.append(re.escape(segment).replace(r"\*", ".*").replace(r"\?", "."))
+    return "|".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +251,7 @@ def matches_deny(tool_name: str, tool_input: dict, deny_list: list[str]) -> bool
                 continue
             # Match against the primary input field (command for Bash, etc.)
             input_str = _primary_input(tool_name, tool_input)
-            # Convert glob-style to regex
-            regex = re.escape(pat_input).replace(r"\*", ".*").replace(r"\?", ".")
+            regex = _glob_to_regex(pat_input)
             if re.match(regex, input_str):
                 return True
         else:
@@ -266,12 +293,18 @@ def generate_scope_id() -> str:
 
 
 def save_session_policy(policy: dict) -> Path:
-    """Write a session policy file. Returns the path."""
+    """Write a session policy file with hardened permissions. Returns the path."""
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(SESSION_DIR, 0o700)
     path = SESSION_DIR / f"{policy['scope_id']}.json"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(policy, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    data = json.dumps(policy, indent=2).encode("utf-8")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp), str(path))
     return path
 
 
@@ -380,7 +413,7 @@ def matches_allow(tool_name: str, tool_input: dict, allow_patterns: list[str]) -
             if pat_tool != tool_name:
                 continue
             input_str = _primary_input(tool_name, tool_input)
-            regex = re.escape(pat_input).replace(r"\*", ".*").replace(r"\?", ".")
+            regex = _glob_to_regex(pat_input)
             if re.match(regex, input_str):
                 return True
         else:
@@ -399,12 +432,34 @@ def matches_allow(tool_name: str, tool_input: dict, allow_patterns: list[str]) -
 # ---------------------------------------------------------------------------
 
 
+def _rotate_log(log_path: str, backup_count: int) -> None:
+    """Rotate log files: .log → .log.1, .log.1 → .log.2, etc."""
+    for i in range(backup_count, 0, -1):
+        src = f"{log_path}.{i}" if i > 1 else f"{log_path}.1"
+        dst = f"{log_path}.{i + 1}" if i < backup_count else None
+        # Drop the oldest backup if at limit
+        if i == backup_count and Path(src).exists():
+            Path(src).unlink()
+            continue
+    # Shift existing backups up
+    for i in range(backup_count - 1, 0, -1):
+        src = f"{log_path}.{i}"
+        dst = f"{log_path}.{i + 1}"
+        if Path(src).exists():
+            os.replace(src, dst)
+    # Move current log to .1
+    if Path(log_path).exists():
+        os.replace(log_path, f"{log_path}.1")
+
+
 def audit_log(source: str, action: str, tool_name: str, detail: str, cfg: dict | None = None):
-    """Append a TSV line to the audit log."""
+    """Append a TSV line to the audit log with hardened permissions and size-based rotation."""
     cfg = cfg or load_config()
     log_cfg = cfg.get("logging", {})
     level = log_cfg.get("level", "actions")
     log_path = log_cfg.get("audit_log", "/tmp/agentnanny.log")
+    max_size_bytes = int(log_cfg.get("max_size_bytes", 10485760))
+    backup_count = int(log_cfg.get("backup_count", 3))
 
     if level == "actions" and action not in ("allowed", "denied", "approved", "expanded"):
         return
@@ -412,8 +467,16 @@ def audit_log(source: str, action: str, tool_name: str, detail: str, cfg: dict |
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     line = f"{ts}\t{source}\t{action}\t{tool_name}\t{detail}\n"
     try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(line)
+        # Size-based rotation
+        p = Path(log_path)
+        if p.exists() and p.stat().st_size >= max_size_bytes:
+            _rotate_log(log_path, backup_count)
+        # Open with hardened permissions (0o600)
+        fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
     except OSError:
         pass  # Log failure is not fatal
 
@@ -1026,6 +1089,21 @@ def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
     if group_names:
         resolve_groups(group_names, cfg)
 
+    # Validate deny pattern syntax
+    for pat in deny_patterns:
+        m_pat = re.match(r'^(\w+)\((.+)\)$', pat)
+        if m_pat:
+            try:
+                re.compile(_glob_to_regex(m_pat.group(2)))
+            except re.error as exc:
+                raise ValueError(f"Invalid deny pattern {pat!r}: {exc}") from exc
+        else:
+            # Plain pattern is used as regex in fullmatch — validate it
+            try:
+                re.compile(pat)
+            except re.error as exc:
+                raise ValueError(f"Invalid deny pattern {pat!r}: {exc}") from exc
+
     scope_id = generate_scope_id()
     policy = {
         "scope_id": scope_id,
@@ -1184,6 +1262,30 @@ def cmd_sessions():
         print(f"{scope_id}  age={age}s  {ttl_str}  groups=[{groups}]  tools=[{tools}]")
 
 
+def cmd_prune():
+    """Remove expired session policy files."""
+    if not SESSION_DIR.exists():
+        print("No sessions directory")
+        return
+    now = datetime.now(timezone.utc)
+    removed = 0
+    for path in SESSION_DIR.glob("*.json"):
+        try:
+            policy = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            path.unlink(missing_ok=True)
+            removed += 1
+            continue
+        ttl = policy.get("ttl_seconds", 0)
+        if ttl > 0:
+            created = datetime.fromisoformat(policy["created"])
+            elapsed = (now - created).total_seconds()
+            if elapsed > ttl:
+                path.unlink(missing_ok=True)
+                removed += 1
+    print(f"Pruned {removed} expired session(s)")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1231,6 +1333,7 @@ def main():
 
     sub.add_parser("profiles", help="List available profiles")
     sub.add_parser("sessions", help="List active session policies")
+    sub.add_parser("prune", help="Remove expired session files")
 
     args = parser.parse_args()
 
@@ -1262,6 +1365,8 @@ def main():
         cmd_list_profiles()
     elif args.command == "sessions":
         cmd_sessions()
+    elif args.command == "prune":
+        cmd_prune()
     else:
         parser.print_help()
         raise SystemExit(1)

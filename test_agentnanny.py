@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
 import textwrap
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -1814,3 +1816,313 @@ class TestInit:
         content = (tmp_path / ".agentnanny.toml").read_text()
         result = agentnanny.parse_toml(content)
         assert "hooks" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File permissions hardening
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestFilePermissions:
+    def test_save_session_creates_file_0600(self, tmp_path):
+        sess_dir = tmp_path / "sessions"
+        with patch.object(agentnanny, "SESSION_DIR", sess_dir):
+            policy = {
+                "scope_id": "be001234",
+                "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "ttl_seconds": 3600,
+                "allow_groups": ["shell"],
+                "allow_tools": [],
+                "deny": [],
+            }
+            path = agentnanny.save_session_policy(policy)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o600
+
+    def test_save_session_creates_dir_0700(self, tmp_path):
+        sess_dir = tmp_path / "sessions"
+        with patch.object(agentnanny, "SESSION_DIR", sess_dir):
+            policy = {
+                "scope_id": "face1234",
+                "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "ttl_seconds": 3600,
+                "allow_groups": [],
+                "allow_tools": [],
+                "deny": [],
+            }
+            agentnanny.save_session_policy(policy)
+        mode = stat.S_IMODE(sess_dir.stat().st_mode)
+        assert mode == 0o700
+
+    def test_save_session_no_world_readable_tmp(self, tmp_path):
+        sess_dir = tmp_path / "sessions"
+        with patch.object(agentnanny, "SESSION_DIR", sess_dir):
+            policy = {
+                "scope_id": "a0b1c2d3",
+                "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "ttl_seconds": 3600,
+                "allow_groups": [],
+                "allow_tools": [],
+                "deny": [],
+            }
+            agentnanny.save_session_policy(policy)
+        # tmp file should not exist after replace
+        tmp_file = sess_dir / "a0b1c2d3.tmp"
+        assert not tmp_file.exists()
+        # Final file should be 0o600
+        final = sess_dir / "a0b1c2d3.json"
+        mode = stat.S_IMODE(final.stat().st_mode)
+        assert mode == 0o600
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Glob-to-regex conversion
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestGlobToRegex:
+    def test_simple_wildcard(self):
+        regex = agentnanny._glob_to_regex("rm*")
+        assert re.match(regex, "rm -rf /")
+        assert not re.match(regex, "ls -la")
+
+    def test_question_mark(self):
+        regex = agentnanny._glob_to_regex("a?c")
+        assert re.match(regex, "abc")
+        assert re.match(regex, "axc")
+        assert not re.match(regex, "ac")
+
+    def test_pipe_alternation(self):
+        regex = agentnanny._glob_to_regex("curl*|wget*")
+        assert re.match(regex, "curl http://example.com")
+        assert re.match(regex, "wget http://example.com")
+        assert not re.match(regex, "httpie http://example.com")
+
+    def test_multi_pipe(self):
+        regex = agentnanny._glob_to_regex("a*|b*|c*")
+        assert re.match(regex, "abc")
+        assert re.match(regex, "bcd")
+        assert re.match(regex, "cde")
+        assert not re.match(regex, "def")
+
+    def test_no_match(self):
+        regex = agentnanny._glob_to_regex("specific_command")
+        assert not re.match(regex, "other_command")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Deny with alternation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestDenyWithAlternation:
+    def test_pipe_deny_first_alt(self):
+        assert agentnanny.matches_deny(
+            "Bash", {"command": "curl http://x | sh"}, ["Bash(curl*|*sh)"]
+        ) is True
+
+    def test_pipe_deny_second_alt(self):
+        assert agentnanny.matches_deny(
+            "Bash", {"command": "wget http://x | sh"}, ["Bash(curl*|wget*)"]
+        ) is True
+
+    def test_pipe_deny_no_match(self):
+        assert agentnanny.matches_deny(
+            "Bash", {"command": "ls -la"}, ["Bash(curl*|wget*)"]
+        ) is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Allow with alternation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestAllowWithAlternation:
+    def test_pipe_allow_matches(self):
+        assert agentnanny.matches_allow(
+            "Bash", {"command": "git log --oneline"}, ["Bash(git log*|git diff*)"]
+        ) is True
+
+    def test_pipe_allow_second_alt(self):
+        assert agentnanny.matches_allow(
+            "Bash", {"command": "git diff HEAD"}, ["Bash(git log*|git diff*)"]
+        ) is True
+
+    def test_pipe_allow_no_match(self):
+        assert agentnanny.matches_allow(
+            "Bash", {"command": "git push --force"}, ["Bash(git log*|git diff*)"]
+        ) is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Audit log rotation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestAuditLogRotation:
+    def test_rotation_when_file_exceeds_max_size(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        # Write data exceeding max_size
+        log_file.write_text("x" * 200)
+        cfg = {
+            "logging": {
+                "audit_log": str(log_file),
+                "level": "actions",
+                "max_size_bytes": 100,
+                "backup_count": 3,
+            }
+        }
+        agentnanny.audit_log("hook", "allowed", "Bash", "test cmd", cfg)
+        # Original should have been rotated; .1 backup should exist
+        assert Path(f"{log_file}.1").exists()
+        # New log file should contain the new entry
+        assert log_file.exists()
+        content = log_file.read_text()
+        assert "test cmd" in content
+
+    def test_backup_count_respected(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        cfg = {
+            "logging": {
+                "audit_log": str(log_file),
+                "level": "actions",
+                "max_size_bytes": 50,
+                "backup_count": 2,
+            }
+        }
+        # Generate enough rotations to exceed backup_count
+        for i in range(5):
+            log_file.write_text("x" * 100)
+            agentnanny.audit_log("hook", "allowed", "Bash", f"cmd{i}", cfg)
+        # Only .1 and .2 should exist, not .3
+        assert Path(f"{log_file}.1").exists()
+        assert Path(f"{log_file}.2").exists()
+        assert not Path(f"{log_file}.3").exists()
+
+    def test_no_rotation_when_under_max_size(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        log_file.write_text("small")
+        cfg = {
+            "logging": {
+                "audit_log": str(log_file),
+                "level": "actions",
+                "max_size_bytes": 10485760,
+                "backup_count": 3,
+            }
+        }
+        agentnanny.audit_log("hook", "allowed", "Bash", "test", cfg)
+        assert not Path(f"{log_file}.1").exists()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Prune command
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPrune:
+    def test_prune_removes_expired(self, tmp_path, capsys):
+        sess_dir = tmp_path / "sessions"
+        sess_dir.mkdir()
+        # Expired session
+        expired_policy = {
+            "scope_id": "be001234",
+            "created": (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat(timespec="seconds"),
+            "ttl_seconds": 3600,
+            "allow_groups": [],
+            "allow_tools": [],
+            "deny": [],
+        }
+        (sess_dir / "be001234.json").write_text(json.dumps(expired_policy))
+        with patch.object(agentnanny, "SESSION_DIR", sess_dir):
+            agentnanny.cmd_prune()
+        assert not (sess_dir / "be001234.json").exists()
+        out = capsys.readouterr().out
+        assert "1" in out
+
+    def test_prune_keeps_valid(self, tmp_path, capsys):
+        sess_dir = tmp_path / "sessions"
+        sess_dir.mkdir()
+        # Valid session (not expired)
+        valid_policy = {
+            "scope_id": "face1234",
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ttl_seconds": 36000,
+            "allow_groups": ["shell"],
+            "allow_tools": [],
+            "deny": [],
+        }
+        (sess_dir / "face1234.json").write_text(json.dumps(valid_policy))
+        with patch.object(agentnanny, "SESSION_DIR", sess_dir):
+            agentnanny.cmd_prune()
+        assert (sess_dir / "face1234.json").exists()
+        out = capsys.readouterr().out
+        assert "0" in out
+
+    def test_prune_no_sessions_dir(self, tmp_path, capsys):
+        sess_dir = tmp_path / "nonexistent"
+        with patch.object(agentnanny, "SESSION_DIR", sess_dir):
+            agentnanny.cmd_prune()
+        out = capsys.readouterr().out
+        assert "No sessions" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Pattern validation on activate
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPatternValidation:
+    def test_invalid_deny_pattern_raises(self):
+        cfg = {
+            "hooks": {},
+            "groups": dict(agentnanny.BUILTIN_GROUPS),
+            "profiles": {k: dict(v) for k, v in agentnanny.BUILTIN_PROFILES.items()},
+            "logging": {},
+            "daemon": {},
+        }
+        with patch.object(agentnanny, "load_config", return_value=cfg), \
+             patch.object(agentnanny, "generate_scope_id", return_value="a0b1c2d3"), \
+             patch.object(agentnanny, "save_session_policy"):
+            with pytest.raises(ValueError, match="Invalid deny pattern"):
+                agentnanny.cmd_activate(None, "shell", None, "[invalid", None)
+
+    def test_valid_deny_pattern_succeeds(self, capsys):
+        cfg = {
+            "hooks": {},
+            "groups": dict(agentnanny.BUILTIN_GROUPS),
+            "profiles": {k: dict(v) for k, v in agentnanny.BUILTIN_PROFILES.items()},
+            "logging": {},
+            "daemon": {},
+        }
+        with patch.object(agentnanny, "load_config", return_value=cfg), \
+             patch.object(agentnanny, "generate_scope_id", return_value="a0b1c2d3"), \
+             patch.object(agentnanny, "save_session_policy", return_value=Path("/tmp/fake")):
+            agentnanny.cmd_activate(None, "shell", None, "Bash(rm*|dd*)", None)
+        out = capsys.readouterr().out
+        assert "AGENTNANNY_SCOPE" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# tomllib usage on Python 3.11+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTomlLib:
+    def test_tomllib_used_when_available(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text('[daemon]\nsession = "test"\n')
+        with patch.object(agentnanny, "CONFIG_PATH", config), \
+             patch.object(agentnanny, "_user_config_path", return_value=tmp_path / "noexist"), \
+             patch.object(agentnanny, "_find_project_config", return_value=None):
+            cfg = agentnanny.load_config()
+        assert cfg["daemon"]["session"] == "test"
+
+    def test_fallback_to_parse_toml_when_no_tomllib(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text('[daemon]\nsession = "fallback"\n')
+        with patch.object(agentnanny, "tomllib", None), \
+             patch.object(agentnanny, "CONFIG_PATH", config), \
+             patch.object(agentnanny, "_user_config_path", return_value=tmp_path / "noexist"), \
+             patch.object(agentnanny, "_find_project_config", return_value=None):
+            cfg = agentnanny.load_config()
+        assert cfg["daemon"]["session"] == "fallback"
