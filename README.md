@@ -61,6 +61,29 @@ claude   # work interactively
 eval $(python agentnanny.py deactivate)
 ```
 
+**Shell aliases** (add to `~/.bashrc` or `~/.zshrc` for quick access):
+
+```bash
+# ── agentnanny ──────────────────────────────────────────────────────────
+_AN="$(command -v agentnanny.py 2>/dev/null || echo /path/to/agentnanny.py)"
+nanny-on()  { eval $(python "$_AN" activate "$@"); }
+nanny-off() { eval $(python "$_AN" deactivate); }
+alias nanny-safe='nanny-on safe-dev'
+alias nanny-full='nanny-on full-dev'
+alias nanny-night='nanny-on overnight'
+alias nanny-status='python "$_AN" status'
+alias nanny-log='python "$_AN" log'
+```
+
+```bash
+nanny-safe                           # filesystem + safe-shell, 8h
+nanny-full                           # filesystem + shell + network, 8h
+nanny-night                          # 12h with force-push/hard-reset denied
+nanny-on full-dev -g pydev --ttl 4h  # profile + extras
+nanny-off                            # deactivate current session
+nanny-status                         # check hook/session status
+```
+
 ## Install
 
 ```bash
@@ -210,9 +233,15 @@ poll_interval = 0.3
 cooldown_seconds = 2.0
 dry_run = false
 
+[context]
+warn_percent = 60              # context window warning threshold
+critical_percent = 75          # context window critical threshold
+
 [logging]
 audit_log = "/tmp/agentnanny.log"
 level = "actions"              # "actions" or "all"
+max_size_bytes = 10485760      # 10MB, then rotate
+backup_count = 3               # keep 3 rotated backups
 ```
 
 ### Environment variables
@@ -239,7 +268,13 @@ Detects: permission prompts (selects "allow for project" or "yes"), trust prompt
 ## Status and Logging
 
 ```bash
-python agentnanny.py status     # hook install, daemon, active sessions
-python agentnanny.py log        # tail the audit log
-python agentnanny.py sessions   # list active session policies
+python agentnanny.py status              # hook install, daemon, active sessions
+python agentnanny.py sessions            # list active session policies
+python agentnanny.py explain [scope_id]  # inspect a session policy in detail
+python agentnanny.py list-groups         # show all configured groups
+python agentnanny.py test-policy Bash -i '{"command":"rm -rf /"}' # dry-run policy check
+python agentnanny.py log                 # tail the audit log
+python agentnanny.py log -n 100 -f json --tool Bash --action denied  # filtered log
+python agentnanny.py extend -g network   # add groups/tools/deny to current session
+python agentnanny.py prune               # remove expired session files
 ```
