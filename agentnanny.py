@@ -260,6 +260,14 @@ def _primary_input(tool_name: str, tool_input: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+_SCOPE_ID_RE = re.compile(r"^[a-f0-9]{8}$")
+
+
+def _valid_scope_id(scope_id: str) -> bool:
+    """Return True if scope_id is a valid 8-char lowercase hex string."""
+    return bool(_SCOPE_ID_RE.fullmatch(scope_id))
+
+
 def generate_scope_id() -> str:
     """Generate a random 8-char hex scope ID."""
     return os.urandom(4).hex()
@@ -267,16 +275,24 @@ def generate_scope_id() -> str:
 
 def save_session_policy(policy: dict) -> Path:
     """Write a session policy file. Returns the path."""
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
     path = SESSION_DIR / f"{policy['scope_id']}.json"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(policy, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(policy, f, indent=2)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(str(tmp), str(path))
     return path
 
 
 def load_session_policy(scope_id: str) -> dict | None:
     """Load a session policy by scope ID. Returns None if missing or expired."""
+    if not _valid_scope_id(scope_id):
+        return None
     path = SESSION_DIR / f"{scope_id}.json"
     if not path.exists():
         return None
@@ -296,6 +312,8 @@ def load_session_policy(scope_id: str) -> dict | None:
 
 def delete_session_policy(scope_id: str) -> bool:
     """Delete a session policy. Returns True if it existed."""
+    if not _valid_scope_id(scope_id):
+        return False
     path = SESSION_DIR / f"{scope_id}.json"
     if path.exists():
         path.unlink()
@@ -1053,6 +1071,9 @@ def cmd_deactivate(scope_id: str | None):
     scope_id = scope_id or os.environ.get("AGENTNANNY_SCOPE")
     if not scope_id:
         print("No scope ID provided and AGENTNANNY_SCOPE not set", file=sys.stderr)
+        raise SystemExit(1)
+    if not _valid_scope_id(scope_id):
+        print(f"Invalid scope ID: {scope_id}", file=sys.stderr)
         raise SystemExit(1)
     if delete_session_policy(scope_id):
         print(f"unset AGENTNANNY_SCOPE")
