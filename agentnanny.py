@@ -1048,6 +1048,63 @@ def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
         print(f"# TTL: {ttl_seconds}s", file=sys.stderr)
 
 
+def cmd_extend(scope_id: str | None, groups: str | None, tools: str | None,
+               deny: str | None):
+    """Add groups, tools, or deny patterns to an existing session policy."""
+    scope_id = scope_id or os.environ.get("AGENTNANNY_SCOPE")
+    if not scope_id:
+        print("No scope ID provided and AGENTNANNY_SCOPE not set", file=sys.stderr)
+        raise SystemExit(1)
+
+    policy = load_session_policy(scope_id)
+    if policy is None:
+        print(f"No active session policy found for {scope_id}", file=sys.stderr)
+        raise SystemExit(1)
+
+    cfg = load_config()
+
+    # Parse new values
+    new_groups = [g.strip() for g in groups.split(",")] if groups else []
+    new_tools = [t.strip() for t in tools.split(",")] if tools else []
+    new_deny = [d.strip() for d in deny.split(",")] if deny else []
+
+    # Validate new groups
+    if new_groups:
+        resolve_groups(new_groups, cfg)
+
+    # Merge with deduplication
+    existing_groups = policy.get("allow_groups", [])
+    existing_tools = policy.get("allow_tools", [])
+    existing_deny = policy.get("deny", [])
+
+    for g in new_groups:
+        if g not in existing_groups:
+            existing_groups.append(g)
+    for t in new_tools:
+        if t not in existing_tools:
+            existing_tools.append(t)
+    for d in new_deny:
+        if d not in existing_deny:
+            existing_deny.append(d)
+
+    policy["allow_groups"] = existing_groups
+    policy["allow_tools"] = existing_tools
+    policy["deny"] = existing_deny
+
+    save_session_policy(policy)
+
+    print(f"# Extended session {scope_id}", file=sys.stderr)
+    if new_groups:
+        print(f"# Added groups: {', '.join(new_groups)}", file=sys.stderr)
+    if new_tools:
+        print(f"# Added tools: {', '.join(new_tools)}", file=sys.stderr)
+    if new_deny:
+        print(f"# Added deny: {', '.join(new_deny)}", file=sys.stderr)
+    print(f"# Groups: {', '.join(existing_groups)}", file=sys.stderr)
+    print(f"# Tools: {', '.join(existing_tools)}", file=sys.stderr)
+    print(f"# Deny: {', '.join(existing_deny)}", file=sys.stderr)
+
+
 def cmd_deactivate(scope_id: str | None):
     """Remove a session policy."""
     scope_id = scope_id or os.environ.get("AGENTNANNY_SCOPE")
@@ -1221,6 +1278,12 @@ def main():
     p_deactivate = sub.add_parser("deactivate", help="Remove a session policy")
     p_deactivate.add_argument("scope_id", nargs="?", default=None, help="Scope ID (default: from AGENTNANNY_SCOPE)")
 
+    p_extend = sub.add_parser("extend", help="Add groups, tools, or deny patterns to an existing session")
+    p_extend.add_argument("scope_id", nargs="?", default=None, help="Scope ID (default: from AGENTNANNY_SCOPE)")
+    p_extend.add_argument("--groups", "-g", default=None, help="Comma-separated group names to add")
+    p_extend.add_argument("--tools", "-t", default=None, help="Comma-separated tool names to add")
+    p_extend.add_argument("--deny", "-d", default=None, help="Comma-separated deny patterns to add")
+
     p_run = sub.add_parser("run", help="Run command with session-scoped permissions")
     p_run.add_argument("profile", nargs="?", default=None, help="Profile name (e.g. safe-dev)")
     p_run.add_argument("--groups", "-g", default=None, help="Comma-separated group names")
@@ -1256,6 +1319,8 @@ def main():
         cmd_activate(args.profile, args.groups, args.tools, args.deny, args.ttl)
     elif args.command == "deactivate":
         cmd_deactivate(args.scope_id)
+    elif args.command == "extend":
+        cmd_extend(args.scope_id, args.groups, args.tools, args.deny)
     elif args.command == "run":
         cmd_run(args.profile, args.groups, args.tools, args.deny, args.ttl, args.command_args)
     elif args.command == "profiles":
