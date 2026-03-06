@@ -1814,3 +1814,120 @@ class TestInit:
         content = (tmp_path / ".agentnanny.toml").read_text()
         result = agentnanny.parse_toml(content)
         assert "hooks" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# List groups
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestListGroups:
+    def test_lists_builtin_groups(self, capsys):
+        agentnanny.cmd_list_groups()
+        out = capsys.readouterr().out
+        assert "filesystem" in out
+        assert "shell" in out
+        assert "network" in out
+        assert "read-only" in out
+        assert "Read" in out
+
+    def test_lists_custom_groups(self, capsys):
+        cfg = {
+            "hooks": {},
+            "groups": {
+                "filesystem": ["Read", "Write", "Edit", "Glob", "Grep"],
+                "custom-dev": ["Bash(pytest*)", "Bash(uv*)"],
+            },
+            "profiles": {},
+            "logging": {},
+        }
+        with patch.object(agentnanny, "load_config", return_value=cfg):
+            agentnanny.cmd_list_groups()
+        out = capsys.readouterr().out
+        assert "custom-dev" in out
+        assert "Bash(pytest*)" in out
+
+    def test_empty_groups(self, capsys):
+        cfg = {
+            "hooks": {},
+            "groups": {},
+            "profiles": {},
+            "logging": {},
+        }
+        with patch.object(agentnanny, "load_config", return_value=cfg):
+            agentnanny.cmd_list_groups()
+        out = capsys.readouterr().out
+        assert "No groups configured" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Explain
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestExplain:
+    def test_explain_active_session(self, tmp_path, capsys):
+        scope_id = "ab12cd34"
+        policy = {
+            "scope_id": scope_id,
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ttl_seconds": 28800,
+            "allow_groups": ["filesystem", "shell"],
+            "allow_tools": ["WebFetch"],
+            "deny": ["Bash(rm -rf*)"],
+        }
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path):
+            agentnanny.save_session_policy(policy)
+            agentnanny.cmd_explain(scope_id)
+        out = capsys.readouterr().out
+        assert f"Session: {scope_id}" in out
+        assert "Created:" in out
+        assert "TTL: 28800s" in out
+        assert "remaining" in out
+        assert "Groups: filesystem, shell" in out
+        assert "Tools: WebFetch" in out
+        assert "Deny: Bash(rm -rf*)" in out
+
+    def test_explain_uses_env_scope(self, tmp_path, capsys):
+        scope_id = "ef567890"
+        policy = {
+            "scope_id": scope_id,
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ttl_seconds": 0,
+            "allow_groups": [],
+            "allow_tools": ["Bash"],
+            "deny": [],
+        }
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
+             patch.dict(os.environ, {"AGENTNANNY_SCOPE": scope_id}):
+            agentnanny.save_session_policy(policy)
+            agentnanny.cmd_explain(None)
+        out = capsys.readouterr().out
+        assert f"Session: {scope_id}" in out
+
+    def test_explain_no_session(self, tmp_path, capsys):
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path):
+            with pytest.raises(SystemExit):
+                agentnanny.cmd_explain("deadbeef")
+        err = capsys.readouterr().err
+        assert "No active session" in err
+
+    def test_explain_shows_group_expansion(self, tmp_path, capsys):
+        scope_id = "aabb1122"
+        policy = {
+            "scope_id": scope_id,
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ttl_seconds": 0,
+            "allow_groups": ["filesystem"],
+            "allow_tools": [],
+            "deny": [],
+        }
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path):
+            agentnanny.save_session_policy(policy)
+            agentnanny.cmd_explain(scope_id)
+        out = capsys.readouterr().out
+        # Should show expanded patterns for the filesystem group
+        assert "filesystem →" in out
+        assert "Read" in out
+        assert "Write" in out
+        assert "Edit" in out
