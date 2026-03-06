@@ -1659,3 +1659,25 @@ class TestPrune:
         out = capsys.readouterr().out
         assert "Pruned 1 expired" in out
         assert not (tmp_path / "bad.json").exists()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Pattern validation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPatternValidation:
+    def test_valid_patterns_no_warning(self, capsys):
+        agentnanny._validate_patterns(["Bash", "Bash(rm*)", ".*Fetch.*"], "deny")
+        assert capsys.readouterr().err == ""
+
+    def test_malformed_pattern_warns(self, capsys):
+        agentnanny._validate_patterns(["rm -rf*"], "deny")
+        err = capsys.readouterr().err
+        assert "Warning" in err
+        assert "rm -rf*" in err
+
+    def test_bare_glob_warns(self, capsys):
+        agentnanny._validate_patterns(["*"], "deny")
+        err = capsys.readouterr().err
+        assert "Warning" in err

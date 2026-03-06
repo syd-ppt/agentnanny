@@ -934,6 +934,17 @@ def show_log():
 # ---------------------------------------------------------------------------
 
 
+_VALID_PATTERN_RE = re.compile(r'^(\w+(\(.+\))?|\.\*.*)$')
+
+
+def _validate_patterns(patterns: list[str], label: str) -> None:
+    """Warn about malformed patterns that will silently match nothing."""
+    for pat in patterns:
+        if not _VALID_PATTERN_RE.match(pat):
+            print(f"# Warning: {label} pattern may be malformed: {pat!r}", file=sys.stderr)
+            print(f"#   Expected: ToolName, ToolName(glob*), or regex", file=sys.stderr)
+
+
 def _parse_ttl(ttl_str: str) -> int:
     """Parse a TTL string like '8h', '30m', '3600' into seconds."""
     ttl_str = ttl_str.strip().lower()
@@ -958,6 +969,12 @@ def cmd_activate(groups: str | None, tools: str | None, deny: str | None, ttl: s
     # Validate group names
     if group_names:
         resolve_groups(group_names, cfg)
+
+    # Validate pattern syntax
+    if deny_patterns:
+        _validate_patterns(deny_patterns, "deny")
+    if tool_names:
+        _validate_patterns(tool_names, "tool")
 
     scope_id = generate_scope_id()
     policy = {
