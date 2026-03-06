@@ -263,5 +263,5 @@ Expired policies are automatically deleted on next read.
 
 ## Requirements
 
-- Python 3.10+ (stdlib only, no dependencies)
+- Python 3.10+ (stdlib only, no dependencies). Python 3.11+ recommended (uses `tomllib` for robust config parsing; 3.10 falls back to a minimal built-in parser).
 - tmux (daemon mode only)

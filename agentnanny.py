@@ -16,6 +16,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:
+    tomllib = None  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -90,7 +95,11 @@ def load_config() -> dict:
     """Load config.toml, with env var overrides."""
     cfg: dict = {"hooks": {}, "daemon": {}, "logging": {}}
     if CONFIG_PATH.exists():
-        cfg = parse_toml(CONFIG_PATH.read_text(encoding="utf-8"))
+        if tomllib is not None:
+            with open(CONFIG_PATH, "rb") as f:
+                cfg = tomllib.load(f)
+        else:
+            cfg = parse_toml(CONFIG_PATH.read_text(encoding="utf-8"))
 
     # Env var overrides
     if v := os.environ.get("AGENTNANNY_SESSION"):
