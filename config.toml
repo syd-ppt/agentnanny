@@ -1,0 +1,22 @@
+[hooks]
+# Tools to always deny (regex patterns matched against tool_name)
+deny = []
+# If set, only these tools are allowed (default: allow all)
+# allow = ["Bash", "Read", "Write", "Edit", "WebFetch"]
+
+[groups]
+filesystem = ["Read", "Write", "Edit", "Glob", "Grep"]
+shell = ["Bash"]
+network = ["WebFetch", "WebSearch"]
+all = [".*"]
+
+[daemon]
+session = "claude"
+poll_interval = 0.3
+cooldown_seconds = 2.0
+dry_run = false
+
+[logging]
+audit_log = "/tmp/agentnanny.log"
+# "all" logs every decision, "actions" logs only allows/denies
+level = "actions"
