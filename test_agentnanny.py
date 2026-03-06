@@ -159,12 +159,16 @@ class TestPrimaryInput:
 
 
 class TestHandleHook:
-    def _run_hook(self, event: dict, deny: list[str] | None = None, allow: list[str] | None = None) -> dict:
-        """Run handle_hook with mocked stdin/stdout/config."""
+    def _run_hook(self, event: dict, deny: list[str] | None = None,
+                  allow: list[str] | None = None) -> dict | None:
+        """Run handle_hook with mocked stdin/stdout/config.
+
+        Returns parsed JSON decision, or None for passthrough (empty output).
+        """
         cfg = {"hooks": {}, "logging": {"audit_log": os.devnull, "level": "all"}}
         if deny:
             cfg["hooks"]["deny"] = deny
-        if allow:
+        if allow is not None:
             cfg["hooks"]["allow"] = allow
 
         stdin = StringIO(json.dumps(event))
@@ -175,24 +179,26 @@ class TestHandleHook:
              patch.object(agentnanny, "load_config", return_value=cfg):
             agentnanny.handle_hook()
 
-        return json.loads(stdout.getvalue())
+        raw = stdout.getvalue()
+        if not raw:
+            return None
+        return json.loads(raw)
 
-    def test_allow_bash(self):
+    def test_passthrough_no_scope_no_allow(self):
+        """Without scope or allow list, hook passes through (no output)."""
         result = self._run_hook({
-            "hook_event_name": "PermissionRequest",
             "tool_name": "Bash",
             "tool_input": {"command": "ls -la"},
         })
-        decision = result["hookSpecificOutput"]["decision"]
-        assert decision["behavior"] == "allow"
+        assert result is None
 
-    def test_allow_read(self):
+    def test_passthrough_read_no_scope(self):
+        """Read tool also passes through when no scope is active."""
         result = self._run_hook({
-            "hook_event_name": "PermissionRequest",
             "tool_name": "Read",
             "tool_input": {"file_path": "/tmp/test.py"},
         })
-        assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+        assert result is None
 
     def test_deny_by_tool_name(self):
         result = self._run_hook(
@@ -208,12 +214,13 @@ class TestHandleHook:
         )
         assert result["hookSpecificOutput"]["decision"]["behavior"] == "deny"
 
-    def test_allow_when_not_denied(self):
+    def test_passthrough_when_not_denied_no_scope(self):
+        """Tool not in deny list but no scope/allow → passthrough."""
         result = self._run_hook(
             {"tool_name": "Bash", "tool_input": {"command": "ls"}},
             deny=["Bash(rm*)"],
         )
-        assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+        assert result is None
 
     def test_allow_list_permits(self):
         result = self._run_hook(
@@ -238,10 +245,11 @@ class TestHandleHook:
         assert result["hookSpecificOutput"]["decision"]["behavior"] == "deny"
 
     def test_output_structure(self):
-        result = self._run_hook({
-            "tool_name": "Bash",
-            "tool_input": {"command": "echo hi"},
-        })
+        """With explicit allow list, output has correct JSON structure."""
+        result = self._run_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "echo hi"}},
+            allow=["Bash"],
+        )
         assert "hookSpecificOutput" in result
         assert "hookEventName" in result["hookSpecificOutput"]
         assert result["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
@@ -249,12 +257,14 @@ class TestHandleHook:
         assert "behavior" in result["hookSpecificOutput"]["decision"]
 
     def test_missing_tool_name(self):
+        """Missing tool_name with no scope → passthrough."""
         result = self._run_hook({"tool_input": {"command": "ls"}})
-        assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+        assert result is None
 
     def test_missing_tool_input(self):
+        """Missing tool_input with no scope → passthrough."""
         result = self._run_hook({"tool_name": "Bash"})
-        assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+        assert result is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -954,6 +964,7 @@ class TestCLI:
                 agentnanny.main()
 
     def test_hook_command(self):
+        """Hook via CLI with no scope → passthrough (empty output)."""
         event = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
         stdin = StringIO(json.dumps(event))
         stdout = StringIO()
@@ -965,8 +976,7 @@ class TestCLI:
              patch.object(agentnanny, "load_config", return_value=cfg):
             agentnanny.main()
 
-        result = json.loads(stdout.getvalue())
-        assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+        assert stdout.getvalue() == ""
 
     def test_status_command(self, tmp_path, capsys):
         settings_file = tmp_path / "settings.json"
@@ -1188,14 +1198,13 @@ class TestHandleHookScoped:
 
         return stdout.getvalue()
 
-    def test_no_scope_legacy_allows(self):
-        """Without AGENTNANNY_SCOPE, hook uses legacy allow-all behavior."""
+    def test_no_scope_passthrough(self):
+        """Without AGENTNANNY_SCOPE and no allow list, hook passes through."""
         raw = self._run_hook_scoped({
             "tool_name": "Bash",
             "tool_input": {"command": "ls"},
         })
-        result = json.loads(raw)
-        assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+        assert raw == ""
 
     def test_scope_valid_policy_allows(self):
         """Tool in session allow groups gets allowed."""
@@ -1319,7 +1328,7 @@ class TestActivateDeactivate:
         }
         with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
              patch.object(agentnanny, "load_config", return_value=cfg):
-            agentnanny.cmd_activate("filesystem", None, None, "0")
+            agentnanny.cmd_activate(None, "filesystem", None, None, "0")
 
         out = capsys.readouterr().out
         assert out.startswith("export AGENTNANNY_SCOPE=")
@@ -1330,7 +1339,7 @@ class TestActivateDeactivate:
         cfg = {"hooks": {}, "groups": {}, "logging": {"audit_log": os.devnull}}
         with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
              patch.object(agentnanny, "load_config", return_value=cfg):
-            agentnanny.cmd_activate(None, "Bash", None, "8h")
+            agentnanny.cmd_activate(None, None, "Bash", None, "8h")
 
         out = capsys.readouterr().out
         scope_id = out.strip().split("=")[1]
@@ -1342,7 +1351,7 @@ class TestActivateDeactivate:
         with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
              patch.object(agentnanny, "load_config", return_value=cfg):
             with pytest.raises(ValueError, match="Unknown group"):
-                agentnanny.cmd_activate("nonexistent", None, None, "0")
+                agentnanny.cmd_activate(None, "nonexistent", None, None, "0")
 
     def test_deactivate_removes_policy(self, tmp_path, capsys):
         with patch.object(agentnanny, "SESSION_DIR", tmp_path):
@@ -1405,7 +1414,7 @@ class TestRunWrapper:
              patch.object(agentnanny, "load_config", return_value=cfg), \
              patch("subprocess.run", mock_run), \
              pytest.raises(SystemExit) as exc_info:
-            agentnanny.cmd_run(None, "Bash", None, "0", ["--", "echo", "hello"])
+            agentnanny.cmd_run(None, None, "Bash", None, "0", ["--", "echo", "hello"])
 
         assert exc_info.value.code == 0
         assert "AGENTNANNY_SCOPE" in captured_env
@@ -1415,11 +1424,11 @@ class TestRunWrapper:
 
     def test_run_no_command_exits(self):
         with pytest.raises(SystemExit):
-            agentnanny.cmd_run(None, None, None, "0", [])
+            agentnanny.cmd_run(None, None, None, None, "0", [])
 
     def test_run_no_command_after_separator_exits(self):
         with pytest.raises(SystemExit):
-            agentnanny.cmd_run(None, None, None, "0", ["--"])
+            agentnanny.cmd_run(None, None, None, None, "0", ["--"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1469,3 +1478,339 @@ class TestParseTtl:
 
     def test_zero(self):
         assert agentnanny._parse_ttl("0") == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOML parser: hyphenated keys
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTomlHyphens:
+    def test_hyphenated_table_name(self):
+        text = '[profiles.safe-dev]\ngroups = ["filesystem", "safe-shell"]'
+        result = agentnanny.parse_toml(text)
+        assert result["profiles"]["safe-dev"]["groups"] == ["filesystem", "safe-shell"]
+
+    def test_hyphenated_key_name(self):
+        text = '[groups]\nsafe-shell = ["Bash(ls*)"]'
+        result = agentnanny.parse_toml(text)
+        assert result["groups"]["safe-shell"] == ["Bash(ls*)"]
+
+    def test_nested_hyphenated_tables(self):
+        text = '[profiles.ci-runner]\nttl = "1h"\ngroups = ["shell"]'
+        result = agentnanny.parse_toml(text)
+        assert result["profiles"]["ci-runner"]["ttl"] == "1h"
+        assert result["profiles"]["ci-runner"]["groups"] == ["shell"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Built-in constants
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestBuiltinConstants:
+    def test_all_expected_groups_defined(self):
+        expected = {"read-only", "write", "filesystem", "shell", "safe-shell",
+                    "review-shell", "network", "all"}
+        assert set(agentnanny.BUILTIN_GROUPS.keys()) == expected
+
+    def test_all_expected_profiles_defined(self):
+        expected = {"safe-dev", "full-dev", "reviewer", "overnight", "ci-runner"}
+        assert set(agentnanny.BUILTIN_PROFILES.keys()) == expected
+
+    def test_profiles_have_required_keys(self):
+        for name, p in agentnanny.BUILTIN_PROFILES.items():
+            assert "groups" in p, f"{name} missing groups"
+            assert "deny" in p, f"{name} missing deny"
+            assert "ttl" in p, f"{name} missing ttl"
+
+    def test_profile_groups_reference_valid_groups(self):
+        for name, p in agentnanny.BUILTIN_PROFILES.items():
+            for g in p["groups"]:
+                assert g in agentnanny.BUILTIN_GROUPS, (
+                    f"Profile {name} references unknown group {g}"
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Deep merge
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestDeepMerge:
+    def test_flat_merge(self):
+        base = {"a": 1, "b": 2}
+        overlay = {"b": 3, "c": 4}
+        result = agentnanny._deep_merge(base, overlay)
+        assert result == {"a": 1, "b": 3, "c": 4}
+
+    def test_nested_merge(self):
+        base = {"hooks": {"deny": ["A"], "allow": ["B"]}, "daemon": {"session": "x"}}
+        overlay = {"hooks": {"deny": ["C"]}}
+        result = agentnanny._deep_merge(base, overlay)
+        assert result["hooks"]["deny"] == ["C"]
+        assert result["hooks"]["allow"] == ["B"]
+        assert result["daemon"]["session"] == "x"
+
+    def test_non_dict_replaces(self):
+        base = {"key": [1, 2, 3]}
+        overlay = {"key": [4, 5]}
+        result = agentnanny._deep_merge(base, overlay)
+        assert result["key"] == [4, 5]
+
+    def test_does_not_mutate_base(self):
+        base = {"a": {"b": 1}}
+        overlay = {"a": {"c": 2}}
+        agentnanny._deep_merge(base, overlay)
+        assert "c" not in base["a"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Config paths
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestConfigPaths:
+    def test_user_config_path_windows(self):
+        with patch("sys.platform", "win32"), \
+             patch.dict(os.environ, {"APPDATA": "C:\\Users\\X\\AppData\\Roaming"}):
+            p = agentnanny._user_config_path()
+            assert str(p).endswith("config.toml")
+            assert "agentnanny" in str(p)
+
+    def test_user_config_path_linux(self):
+        with patch("sys.platform", "linux"), \
+             patch.dict(os.environ, {"XDG_CONFIG_HOME": "/home/x/.config"}):
+            p = agentnanny._user_config_path()
+            # Path separators vary by OS; check components
+            assert p.parts[-3:] == ("agentnanny", "config.toml")[-2:] or \
+                   str(p).replace("\\", "/").endswith(".config/agentnanny/config.toml")
+
+    def test_find_project_config_found(self, tmp_path):
+        (tmp_path / ".agentnanny.toml").write_text("[hooks]\ndeny = []")
+        sub = tmp_path / "sub" / "dir"
+        sub.mkdir(parents=True)
+        with patch("pathlib.Path.cwd", return_value=sub):
+            result = agentnanny._find_project_config()
+        assert result == tmp_path / ".agentnanny.toml"
+
+    def test_find_project_config_not_found(self, tmp_path):
+        with patch("pathlib.Path.cwd", return_value=tmp_path):
+            result = agentnanny._find_project_config()
+        assert result is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Layered config
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestLayeredConfig:
+    def test_builtins_present_without_config(self, tmp_path):
+        with patch.object(agentnanny, "CONFIG_PATH", tmp_path / "no.toml"), \
+             patch.object(agentnanny, "_user_config_path", return_value=tmp_path / "no2.toml"), \
+             patch.object(agentnanny, "_find_project_config", return_value=None):
+            cfg = agentnanny.load_config()
+        assert "safe-shell" in cfg["groups"]
+        assert "safe-dev" in cfg["profiles"]
+        assert "filesystem" in cfg["groups"]
+
+    def test_script_adjacent_overrides_builtin(self, tmp_path):
+        script_cfg = tmp_path / "config.toml"
+        script_cfg.write_text('[groups]\nfilesystem = ["Read"]')
+        with patch.object(agentnanny, "CONFIG_PATH", script_cfg), \
+             patch.object(agentnanny, "_user_config_path", return_value=tmp_path / "no.toml"), \
+             patch.object(agentnanny, "_find_project_config", return_value=None):
+            cfg = agentnanny.load_config()
+        assert cfg["groups"]["filesystem"] == ["Read"]
+        # Other builtin groups still present
+        assert "safe-shell" in cfg["groups"]
+
+    def test_project_overrides_user(self, tmp_path):
+        user_cfg = tmp_path / "user.toml"
+        user_cfg.write_text('[hooks]\ndeny = ["Bash"]')
+        proj_cfg = tmp_path / "proj.toml"
+        proj_cfg.write_text('[hooks]\ndeny = ["WebFetch"]')
+        with patch.object(agentnanny, "CONFIG_PATH", tmp_path / "no.toml"), \
+             patch.object(agentnanny, "_user_config_path", return_value=user_cfg), \
+             patch.object(agentnanny, "_find_project_config", return_value=proj_cfg):
+            cfg = agentnanny.load_config()
+        assert cfg["hooks"]["deny"] == ["WebFetch"]
+
+    def test_custom_profile_in_config(self, tmp_path):
+        script_cfg = tmp_path / "config.toml"
+        script_cfg.write_text(
+            '[profiles.my-custom]\ngroups = ["shell"]\ndeny = []\nttl = "2h"'
+        )
+        with patch.object(agentnanny, "CONFIG_PATH", script_cfg), \
+             patch.object(agentnanny, "_user_config_path", return_value=tmp_path / "no.toml"), \
+             patch.object(agentnanny, "_find_project_config", return_value=None):
+            cfg = agentnanny.load_config()
+        assert "my-custom" in cfg["profiles"]
+        assert cfg["profiles"]["my-custom"]["groups"] == ["shell"]
+        # Builtins still present
+        assert "safe-dev" in cfg["profiles"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Profile resolution
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestResolveProfile:
+    def _cfg(self):
+        return {
+            "groups": dict(agentnanny.BUILTIN_GROUPS),
+            "profiles": {k: dict(v) for k, v in agentnanny.BUILTIN_PROFILES.items()},
+        }
+
+    def test_resolve_builtin(self):
+        result = agentnanny.resolve_profile("safe-dev", self._cfg())
+        assert result["groups"] == ["filesystem", "safe-shell"]
+        assert result["ttl"] == "8h"
+        assert result["deny"] == []
+
+    def test_resolve_with_deny(self):
+        result = agentnanny.resolve_profile("full-dev", self._cfg())
+        assert len(result["deny"]) == 3
+        assert any("rm -rf" in d for d in result["deny"])
+
+    def test_unknown_raises(self):
+        with pytest.raises(ValueError, match="Unknown profile.*Available"):
+            agentnanny.resolve_profile("nonexistent", self._cfg())
+
+    def test_custom_profile(self):
+        cfg = self._cfg()
+        cfg["profiles"]["custom"] = {"groups": ["shell"], "deny": [], "ttl": "1h"}
+        result = agentnanny.resolve_profile("custom", cfg)
+        assert result["groups"] == ["shell"]
+        assert result["ttl"] == "1h"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Profile CLI integration
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestProfileCLI:
+    def _cfg(self):
+        return {
+            "hooks": {},
+            "groups": dict(agentnanny.BUILTIN_GROUPS),
+            "profiles": {k: dict(v) for k, v in agentnanny.BUILTIN_PROFILES.items()},
+            "logging": {"audit_log": os.devnull},
+        }
+
+    def test_activate_with_profile(self, tmp_path, capsys):
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
+             patch.object(agentnanny, "load_config", return_value=self._cfg()):
+            agentnanny.cmd_activate("safe-dev", None, None, None, None)
+
+        out = capsys.readouterr().out
+        scope_id = out.strip().split("=")[1]
+        policy = json.loads((tmp_path / f"{scope_id}.json").read_text())
+        assert "filesystem" in policy["allow_groups"]
+        assert "safe-shell" in policy["allow_groups"]
+        assert policy["ttl_seconds"] == 28800  # 8h
+
+    def test_activate_profile_plus_extra_deny(self, tmp_path, capsys):
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
+             patch.object(agentnanny, "load_config", return_value=self._cfg()):
+            agentnanny.cmd_activate("full-dev", None, None, "Bash(shutdown*)", None)
+
+        out = capsys.readouterr().out
+        scope_id = out.strip().split("=")[1]
+        policy = json.loads((tmp_path / f"{scope_id}.json").read_text())
+        assert "Bash(shutdown*)" in policy["deny"]
+        assert len(policy["deny"]) == 4  # 3 from full-dev + 1 extra
+
+    def test_activate_profile_plus_extra_groups(self, tmp_path, capsys):
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
+             patch.object(agentnanny, "load_config", return_value=self._cfg()):
+            agentnanny.cmd_activate("reviewer", "network", None, None, None)
+
+        out = capsys.readouterr().out
+        scope_id = out.strip().split("=")[1]
+        policy = json.loads((tmp_path / f"{scope_id}.json").read_text())
+        assert "read-only" in policy["allow_groups"]
+        assert "review-shell" in policy["allow_groups"]
+        assert "network" in policy["allow_groups"]
+
+    def test_activate_profile_ttl_override(self, tmp_path, capsys):
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
+             patch.object(agentnanny, "load_config", return_value=self._cfg()):
+            agentnanny.cmd_activate("safe-dev", None, None, None, "2h")
+
+        out = capsys.readouterr().out
+        scope_id = out.strip().split("=")[1]
+        policy = json.loads((tmp_path / f"{scope_id}.json").read_text())
+        assert policy["ttl_seconds"] == 7200  # 2h overrides 8h
+
+    def test_run_with_profile(self, tmp_path):
+        captured_env = {}
+
+        def mock_run(args, env=None):
+            captured_env.update(env or {})
+            return subprocess.CompletedProcess(args, 0)
+
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
+             patch.object(agentnanny, "load_config", return_value=self._cfg()), \
+             patch("subprocess.run", mock_run), \
+             pytest.raises(SystemExit) as exc_info:
+            agentnanny.cmd_run("safe-dev", None, None, None, None, ["--", "echo", "hello"])
+
+        assert exc_info.value.code == 0
+        assert "AGENTNANNY_SCOPE" in captured_env
+        scope_id = captured_env["AGENTNANNY_SCOPE"]
+        assert not (tmp_path / f"{scope_id}.json").exists()  # cleaned up
+
+    def test_list_profiles(self, capsys):
+        with patch.object(agentnanny, "load_config", return_value=self._cfg()):
+            agentnanny.cmd_list_profiles()
+        out = capsys.readouterr().out
+        assert "safe-dev" in out
+        assert "full-dev" in out
+        assert "reviewer" in out
+        assert "overnight" in out
+        assert "ci-runner" in out
+        assert "builtin" in out
+
+    def test_list_profiles_with_custom(self, capsys):
+        cfg = self._cfg()
+        cfg["profiles"]["my-custom"] = {"groups": ["shell"], "deny": [], "ttl": "2h"}
+        with patch.object(agentnanny, "load_config", return_value=cfg):
+            agentnanny.cmd_list_profiles()
+        out = capsys.readouterr().out
+        assert "my-custom" in out
+        assert "config" in out  # source label
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Init command
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestInit:
+    def test_creates_project_config(self, tmp_path, capsys):
+        with patch("pathlib.Path.cwd", return_value=tmp_path):
+            agentnanny.cmd_init()
+        target = tmp_path / ".agentnanny.toml"
+        assert target.exists()
+        content = target.read_text()
+        assert "[hooks]" in content
+        assert "profiles" in content
+        out = capsys.readouterr().out
+        assert "Created" in out
+
+    def test_refuses_if_exists(self, tmp_path):
+        (tmp_path / ".agentnanny.toml").write_text("existing")
+        with patch("pathlib.Path.cwd", return_value=tmp_path):
+            with pytest.raises(SystemExit):
+                agentnanny.cmd_init()
+
+    def test_created_file_is_valid_toml(self, tmp_path):
+        with patch("pathlib.Path.cwd", return_value=tmp_path):
+            agentnanny.cmd_init()
+        content = (tmp_path / ".agentnanny.toml").read_text()
+        result = agentnanny.parse_toml(content)
+        assert "hooks" in result

@@ -27,6 +27,84 @@ PID_FILE = Path("/tmp/agentnanny.pid") if sys.platform != "win32" else Path(os.e
 SESSION_DIR = Path(tempfile.gettempdir()) / "agentnanny" / "sessions"
 
 # ---------------------------------------------------------------------------
+# Built-in groups and profiles (work without any config file)
+# ---------------------------------------------------------------------------
+
+BUILTIN_GROUPS: dict[str, list[str]] = {
+    "read-only":    ["Read", "Glob", "Grep"],
+    "write":        ["Write", "Edit"],
+    "filesystem":   ["Read", "Write", "Edit", "Glob", "Grep"],
+    "shell":        ["Bash"],
+    "safe-shell":   ["Bash(ls*)", "Bash(cat*)", "Bash(head*)", "Bash(grep*)", "Bash(find*)"],
+    "review-shell": ["Bash(git log*)", "Bash(git diff*)", "Bash(git show*)", "Bash(git blame*)"],
+    "network":      ["WebFetch", "WebSearch"],
+    "all":          [".*"],
+}
+
+BUILTIN_PROFILES: dict[str, dict] = {
+    "safe-dev": {
+        "groups": ["filesystem", "safe-shell"],
+        "deny": [],
+        "ttl": "8h",
+    },
+    "full-dev": {
+        "groups": ["filesystem", "shell", "network"],
+        "deny": ["Bash(rm -rf /*)", "Bash(DROP TABLE*)", "Bash(git push --force*)"],
+        "ttl": "8h",
+    },
+    "reviewer": {
+        "groups": ["read-only", "review-shell"],
+        "deny": [],
+        "ttl": "4h",
+    },
+    "overnight": {
+        "groups": ["filesystem", "shell", "network"],
+        "deny": ["Bash(git push --force*)", "Bash(git reset --hard*)"],
+        "ttl": "12h",
+    },
+    "ci-runner": {
+        "groups": ["filesystem", "shell"],
+        "deny": ["Bash(curl*|*sh)", "Bash(wget*|*sh)", "WebFetch", "WebSearch"],
+        "ttl": "1h",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Config path helpers
+# ---------------------------------------------------------------------------
+
+
+def _user_config_path() -> Path:
+    """Return user-level config path. APPDATA on Windows, XDG on Linux/macOS."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "agentnanny" / "config.toml"
+
+
+def _find_project_config() -> Path | None:
+    """Walk up from cwd looking for .agentnanny.toml."""
+    current = Path.cwd().resolve()
+    for parent in [current, *current.parents]:
+        candidate = parent / ".agentnanny.toml"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Merge overlay into base. Dict values merge recursively; others replaced."""
+    result = dict(base)
+    for key, val in overlay.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Minimal TOML parser (stdlib only — handles flat tables, strings, arrays)
 # ---------------------------------------------------------------------------
 
@@ -40,7 +118,7 @@ def parse_toml(text: str) -> dict:
         if not line or line.startswith("#"):
             continue
         # Table header
-        m = re.match(r"^\[([a-zA-Z0-9_.]+)\]$", line)
+        m = re.match(r"^\[([a-zA-Z0-9_.:-]+)\]$", line)
         if m:
             parts = m.group(1).split(".")
             current_table = result
@@ -48,7 +126,7 @@ def parse_toml(text: str) -> dict:
                 current_table = current_table.setdefault(p, {})
             continue
         # Key = value
-        m = re.match(r'^([a-zA-Z0-9_]+)\s*=\s*(.+)$', line)
+        m = re.match(r'^([a-zA-Z0-9_-]+)\s*=\s*(.+)$', line)
         if not m:
             continue
         key, raw = m.group(1), m.group(2).strip()
@@ -86,12 +164,30 @@ def _parse_toml_value(raw: str):
 
 
 def load_config() -> dict:
-    """Load config.toml, with env var overrides."""
-    cfg: dict = {"hooks": {}, "daemon": {}, "logging": {}}
-    if CONFIG_PATH.exists():
-        cfg = parse_toml(CONFIG_PATH.read_text(encoding="utf-8"))
+    """Load config with layered merge: builtins -> script-adjacent -> user -> project -> env vars."""
+    cfg: dict = {
+        "hooks": {},
+        "daemon": {},
+        "logging": {},
+        "groups": dict(BUILTIN_GROUPS),
+        "profiles": {k: dict(v) for k, v in BUILTIN_PROFILES.items()},
+    }
 
-    # Env var overrides
+    # Layer 1: script-adjacent config.toml (backward compat)
+    if CONFIG_PATH.exists():
+        cfg = _deep_merge(cfg, parse_toml(CONFIG_PATH.read_text(encoding="utf-8")))
+
+    # Layer 2: user config (~/.config/agentnanny/config.toml or %APPDATA%)
+    user_path = _user_config_path()
+    if user_path.exists():
+        cfg = _deep_merge(cfg, parse_toml(user_path.read_text(encoding="utf-8")))
+
+    # Layer 3: project config (.agentnanny.toml walking up from cwd)
+    proj_path = _find_project_config()
+    if proj_path is not None:
+        cfg = _deep_merge(cfg, parse_toml(proj_path.read_text(encoding="utf-8")))
+
+    # Layer 4: env var overrides
     if v := os.environ.get("AGENTNANNY_SESSION"):
         cfg.setdefault("daemon", {})["session"] = v
     if v := os.environ.get("AGENTNANNY_DENY"):
@@ -246,6 +342,25 @@ def resolve_groups(group_names: list[str], cfg: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Profile resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_profile(name: str, cfg: dict) -> dict:
+    """Look up a profile by name. Returns dict with keys: groups, deny, ttl."""
+    profiles = cfg.get("profiles", {})
+    profile = profiles.get(name)
+    if profile is None:
+        available = ", ".join(sorted(profiles))
+        raise ValueError(f"Unknown profile: {name}. Available: {available}")
+    return {
+        "groups": list(profile.get("groups", [])),
+        "deny": list(profile.get("deny", [])),
+        "ttl": str(profile.get("ttl", "0")),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Allow matching
 # ---------------------------------------------------------------------------
 
@@ -356,10 +471,13 @@ def handle_hook():
     scope_id = os.environ.get("AGENTNANNY_SCOPE")
 
     if not scope_id:
-        # Legacy mode — original v1 behavior
+        # No active scope — check for explicit allow list in config
         allow_list = cfg.get("hooks", {}).get("allow", None)
-        if allow_list is not None and tool_name not in allow_list:
-            detail = _primary_input(tool_name, tool_input)[:200]
+        if allow_list is None:
+            # No scope, no allow list → passthrough to normal permission dialog
+            return
+        # Explicit allow list set → enforce it
+        if tool_name not in allow_list:
             _hook_deny(tool_name, f"{tool_name} not in allow list", cfg)
             return
         detail = _primary_input(tool_name, tool_input)[:200]
@@ -882,14 +1000,27 @@ def _parse_ttl(ttl_str: str) -> int:
     return int(ttl_str)
 
 
-def cmd_activate(groups: str | None, tools: str | None, deny: str | None, ttl: str):
+def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
+                 deny: str | None, ttl: str | None):
     """Create a session policy and print the env export command."""
     cfg = load_config()
 
-    group_names = [g.strip() for g in groups.split(",")] if groups else []
+    # Start from profile defaults if specified
+    if profile:
+        p = resolve_profile(profile, cfg)
+        base_groups = p["groups"]
+        base_deny = p["deny"]
+        base_ttl = p["ttl"]
+    else:
+        base_groups = []
+        base_deny = []
+        base_ttl = "0"
+
+    # CLI flags merge on top of profile
+    group_names = base_groups + ([g.strip() for g in groups.split(",")] if groups else [])
     tool_names = [t.strip() for t in tools.split(",")] if tools else []
-    deny_patterns = [d.strip() for d in deny.split(",")] if deny else []
-    ttl_seconds = _parse_ttl(ttl)
+    deny_patterns = base_deny + ([d.strip() for d in deny.split(",")] if deny else [])
+    ttl_seconds = _parse_ttl(ttl if ttl is not None else base_ttl)
 
     # Validate group names
     if group_names:
@@ -931,7 +1062,8 @@ def cmd_deactivate(scope_id: str | None):
         raise SystemExit(1)
 
 
-def cmd_run(groups: str | None, tools: str | None, deny: str | None, ttl: str, command_args: list[str]):
+def cmd_run(profile: str | None, groups: str | None, tools: str | None,
+            deny: str | None, ttl: str | None, command_args: list[str]):
     """Run a command with session-scoped permissions."""
     if not command_args:
         print("No command specified", file=sys.stderr)
@@ -944,10 +1076,23 @@ def cmd_run(groups: str | None, tools: str | None, deny: str | None, ttl: str, c
         raise SystemExit(1)
 
     cfg = load_config()
-    group_names = [g.strip() for g in groups.split(",")] if groups else []
+
+    # Start from profile defaults if specified
+    if profile:
+        p = resolve_profile(profile, cfg)
+        base_groups = p["groups"]
+        base_deny = p["deny"]
+        base_ttl = p["ttl"]
+    else:
+        base_groups = []
+        base_deny = []
+        base_ttl = "0"
+
+    # CLI flags merge on top of profile
+    group_names = base_groups + ([g.strip() for g in groups.split(",")] if groups else [])
     tool_names = [t.strip() for t in tools.split(",")] if tools else []
-    deny_patterns = [d.strip() for d in deny.split(",")] if deny else []
-    ttl_seconds = _parse_ttl(ttl)
+    deny_patterns = base_deny + ([d.strip() for d in deny.split(",")] if deny else [])
+    ttl_seconds = _parse_ttl(ttl if ttl is not None else base_ttl)
 
     if group_names:
         resolve_groups(group_names, cfg)
@@ -971,6 +1116,54 @@ def cmd_run(groups: str | None, tools: str | None, deny: str | None, ttl: str, c
         raise SystemExit(result.returncode)
     finally:
         delete_session_policy(scope_id)
+
+
+PROJECT_CONFIG_TEMPLATE = """\
+# agentnanny project config
+# This file is loaded automatically when working in this directory.
+# It merges on top of user config and built-in defaults.
+
+[hooks]
+# Project-specific deny patterns (in addition to global deny)
+# deny = ["Bash(terraform destroy*)", "Bash(aws iam delete*)"]
+
+# ── Custom groups for this project ──────────────────────────
+# [groups]
+# project-tools = ["Bash(make*)", "Bash(cargo*)", "Bash(go test*)"]
+
+# ── Custom profiles for this project ────────────────────────
+# [profiles.project-dev]
+# groups = ["filesystem", "shell", "project-tools"]
+# deny = []
+# ttl = "8h"
+"""
+
+
+def cmd_init():
+    """Create a .agentnanny.toml in the current directory."""
+    target = Path.cwd() / ".agentnanny.toml"
+    if target.exists():
+        print(f"Already exists: {target}", file=sys.stderr)
+        raise SystemExit(1)
+    target.write_text(PROJECT_CONFIG_TEMPLATE, encoding="utf-8")
+    print(f"Created {target}")
+
+
+def cmd_list_profiles():
+    """List all available profiles (builtin + config)."""
+    cfg = load_config()
+    profiles = cfg.get("profiles", {})
+    if not profiles:
+        print("No profiles configured")
+        return
+    for name in sorted(profiles):
+        p = profiles[name]
+        groups = ", ".join(p.get("groups", []))
+        deny_count = len(p.get("deny", []))
+        ttl = p.get("ttl", "0")
+        source = "builtin" if name in BUILTIN_PROFILES else "config"
+        deny_str = f"  deny={deny_count}" if deny_count else ""
+        print(f"  {name:<14} groups=[{groups}]  ttl={ttl}{deny_str}  ({source})")
 
 
 def cmd_sessions():
@@ -1014,25 +1207,29 @@ def main():
     p_watch.add_argument("session", nargs="?", help="tmux session name")
 
     sub.add_parser("stop", help="Stop tmux daemon")
+    sub.add_parser("init", help="Create .agentnanny.toml in current directory")
     sub.add_parser("status", help="Show hook + daemon status")
     sub.add_parser("log", help="Tail audit log")
 
     p_activate = sub.add_parser("activate", help="Create a session policy (prints export command)")
+    p_activate.add_argument("profile", nargs="?", default=None, help="Profile name (e.g. safe-dev)")
     p_activate.add_argument("--groups", "-g", default=None, help="Comma-separated group names")
     p_activate.add_argument("--tools", "-t", default=None, help="Comma-separated tool names")
     p_activate.add_argument("--deny", "-d", default=None, help="Comma-separated deny patterns")
-    p_activate.add_argument("--ttl", default="0", help="TTL (e.g. 8h, 30m, 3600)")
+    p_activate.add_argument("--ttl", default=None, help="TTL (e.g. 8h, 30m, 3600)")
 
     p_deactivate = sub.add_parser("deactivate", help="Remove a session policy")
     p_deactivate.add_argument("scope_id", nargs="?", default=None, help="Scope ID (default: from AGENTNANNY_SCOPE)")
 
     p_run = sub.add_parser("run", help="Run command with session-scoped permissions")
+    p_run.add_argument("profile", nargs="?", default=None, help="Profile name (e.g. safe-dev)")
     p_run.add_argument("--groups", "-g", default=None, help="Comma-separated group names")
     p_run.add_argument("--tools", "-t", default=None, help="Comma-separated tool names")
     p_run.add_argument("--deny", "-d", default=None, help="Comma-separated deny patterns")
-    p_run.add_argument("--ttl", default="0", help="TTL (e.g. 8h, 30m, 3600)")
+    p_run.add_argument("--ttl", default=None, help="TTL (e.g. 8h, 30m, 3600)")
     p_run.add_argument("command_args", nargs=argparse.REMAINDER, help="Command to run (after --)")
 
+    sub.add_parser("profiles", help="List available profiles")
     sub.add_parser("sessions", help="List active session policies")
 
     args = parser.parse_args()
@@ -1049,16 +1246,20 @@ def main():
         start_daemon(args.session)
     elif args.command == "stop":
         stop_daemon()
+    elif args.command == "init":
+        cmd_init()
     elif args.command == "status":
         show_status()
     elif args.command == "log":
         show_log()
     elif args.command == "activate":
-        cmd_activate(args.groups, args.tools, args.deny, args.ttl)
+        cmd_activate(args.profile, args.groups, args.tools, args.deny, args.ttl)
     elif args.command == "deactivate":
         cmd_deactivate(args.scope_id)
     elif args.command == "run":
-        cmd_run(args.groups, args.tools, args.deny, args.ttl, args.command_args)
+        cmd_run(args.profile, args.groups, args.tools, args.deny, args.ttl, args.command_args)
+    elif args.command == "profiles":
+        cmd_list_profiles()
     elif args.command == "sessions":
         cmd_sessions()
     else:

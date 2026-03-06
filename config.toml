@@ -1,14 +1,68 @@
+# agentnanny configuration
+#
+# Config layers (each overrides the previous):
+#   1. Built-in defaults (in code — groups and profiles work without this file)
+#   2. This file (script-adjacent, backward compatible)
+#   3. User config: ~/.config/agentnanny/config.toml (Linux/macOS) or %APPDATA%/agentnanny/config.toml (Windows)
+#   4. Project config: .agentnanny.toml (walks up from cwd)
+#   5. Environment variables
+
 [hooks]
-# Tools to always deny (regex patterns matched against tool_name)
+# Global deny list — blocks these patterns in every session, every terminal
 deny = []
-# If set, only these tools are allowed (default: allow all)
+# Legacy allow list (used when no AGENTNANNY_SCOPE is set)
 # allow = ["Bash", "Read", "Write", "Edit", "WebFetch"]
 
-[groups]
-filesystem = ["Read", "Write", "Edit", "Glob", "Grep"]
-shell = ["Bash"]
-network = ["WebFetch", "WebSearch"]
-all = [".*"]
+# ── Groups ──────────────────────────────────────────────────
+# Built-in groups (override by uncommenting and redefining):
+#
+# [groups]
+# read-only    = ["Read", "Glob", "Grep"]
+# write        = ["Write", "Edit"]
+# filesystem   = ["Read", "Write", "Edit", "Glob", "Grep"]
+# shell        = ["Bash"]
+# safe-shell   = ["Bash(ls*)", "Bash(cat*)", "Bash(head*)", "Bash(grep*)", "Bash(find*)"]
+# review-shell = ["Bash(git log*)", "Bash(git diff*)", "Bash(git show*)", "Bash(git blame*)"]
+# network      = ["WebFetch", "WebSearch"]
+# all          = [".*"]
+#
+# Add custom groups:
+# [groups]
+# dev = ["Bash(pytest*)", "Bash(uv*)", "Bash(npm*)"]
+
+# ── Profiles ────────────────────────────────────────────────
+# Built-in profiles (override by uncommenting and redefining):
+#
+# [profiles.safe-dev]
+# groups = ["filesystem", "safe-shell"]
+# deny   = []
+# ttl    = "8h"
+#
+# [profiles.full-dev]
+# groups = ["filesystem", "shell", "network"]
+# deny   = ["Bash(rm -rf /*)", "Bash(DROP TABLE*)", "Bash(git push --force*)"]
+# ttl    = "8h"
+#
+# [profiles.reviewer]
+# groups = ["read-only", "review-shell"]
+# deny   = []
+# ttl    = "4h"
+#
+# [profiles.overnight]
+# groups = ["filesystem", "shell", "network"]
+# deny   = ["Bash(git push --force*)", "Bash(git reset --hard*)"]
+# ttl    = "12h"
+#
+# [profiles.ci-runner]
+# groups = ["filesystem", "shell"]
+# deny   = ["Bash(curl*|*sh)", "Bash(wget*|*sh)", "WebFetch", "WebSearch"]
+# ttl    = "1h"
+#
+# Add custom profiles:
+# [profiles.my-project]
+# groups = ["filesystem", "dev"]
+# deny   = ["Bash(rm -rf*)"]
+# ttl    = "4h"
 
 [daemon]
 session = "claude"
