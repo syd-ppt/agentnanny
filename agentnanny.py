@@ -1185,6 +1185,70 @@ def cmd_sessions():
 
 
 # ---------------------------------------------------------------------------
+# Dry-run policy evaluation
+# ---------------------------------------------------------------------------
+
+
+def evaluate_policy(
+    tool_name: str, tool_input: dict, cfg: dict, scope_id: str | None = None,
+) -> tuple[str, str]:
+    """Evaluate a tool call against the current policy without side effects.
+
+    Returns (verdict, reason) where verdict is one of:
+    - "deny" — blocked by global or session deny list
+    - "allow" — explicitly allowed by session policy
+    - "passthrough" — not covered, would show normal permission dialog
+    """
+    global_deny = cfg.get("hooks", {}).get("deny", [])
+
+    # Global deny always applies
+    if matches_deny(tool_name, tool_input, global_deny):
+        return ("deny", f"blocked by global deny list")
+
+    if not scope_id:
+        # Legacy mode — check config allow list
+        allow_list = cfg.get("hooks", {}).get("allow", None)
+        if allow_list is None:
+            return ("passthrough", "no scope and no allow list configured")
+        if tool_name in allow_list:
+            return ("allow", f"{tool_name} in legacy allow list")
+        return ("deny", f"{tool_name} not in legacy allow list")
+
+    # Session-scoped mode
+    policy = load_session_policy(scope_id)
+    if policy is None:
+        return ("passthrough", f"no valid session policy for scope {scope_id}")
+
+    # Session-level deny
+    session_deny = policy.get("deny", [])
+    if session_deny and matches_deny(tool_name, tool_input, session_deny):
+        return ("deny", f"blocked by session deny list (scope {scope_id})")
+
+    # Resolve session allow list
+    allow_patterns: list[str] = list(policy.get("allow_tools", []))
+    group_names = policy.get("allow_groups", [])
+    if group_names:
+        try:
+            allow_patterns.extend(resolve_groups(group_names, cfg))
+        except ValueError:
+            pass
+
+    if matches_allow(tool_name, tool_input, allow_patterns):
+        return ("allow", f"{tool_name} allowed by session policy (scope {scope_id})")
+
+    return ("passthrough", f"{tool_name} not in session allow list (scope {scope_id})")
+
+
+def cmd_test_policy(tool_name: str, tool_input_json: str, scope: str | None):
+    """CLI wrapper for evaluate_policy."""
+    tool_input = json.loads(tool_input_json)
+    cfg = load_config()
+    scope_id = scope or os.environ.get("AGENTNANNY_SCOPE")
+    verdict, reason = evaluate_policy(tool_name, tool_input, cfg, scope_id)
+    print(f"{verdict}: {reason}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1232,6 +1296,11 @@ def main():
     sub.add_parser("profiles", help="List available profiles")
     sub.add_parser("sessions", help="List active session policies")
 
+    p_test = sub.add_parser("test-policy", help="Dry-run policy evaluation")
+    p_test.add_argument("tool_name", help="Tool name to evaluate (e.g. Bash, Write)")
+    p_test.add_argument("--input", "-i", default="{}", dest="tool_input", help="JSON string for tool_input (default: {})")
+    p_test.add_argument("--scope", "-s", default=None, help="Scope ID (default: from AGENTNANNY_SCOPE)")
+
     args = parser.parse_args()
 
     if args.command == "hook":
@@ -1262,6 +1331,8 @@ def main():
         cmd_list_profiles()
     elif args.command == "sessions":
         cmd_sessions()
+    elif args.command == "test-policy":
+        cmd_test_policy(args.tool_name, args.tool_input, args.scope)
     else:
         parser.print_help()
         raise SystemExit(1)
