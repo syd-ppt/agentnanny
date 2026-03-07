@@ -2733,3 +2733,591 @@ class TestPostToolUseHook:
         assert len(post) == 1
         assert "agentnanny" in post[0]["hooks"][0]["command"]
         assert "post-hook" in post[0]["hooks"][0]["command"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Codex CLI integration
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSerializeTomlValue:
+    def test_string(self):
+        assert agentnanny._serialize_toml_value("hello") == '"hello"'
+
+    def test_bool_true(self):
+        assert agentnanny._serialize_toml_value(True) == "true"
+
+    def test_bool_false(self):
+        assert agentnanny._serialize_toml_value(False) == "false"
+
+    def test_int(self):
+        assert agentnanny._serialize_toml_value(42) == "42"
+
+    def test_list_of_strings(self):
+        result = agentnanny._serialize_toml_value(["a", "b", "c"])
+        assert result == '["a", "b", "c"]'
+
+    def test_empty_list(self):
+        assert agentnanny._serialize_toml_value([]) == "[]"
+
+    def test_unsupported_type(self):
+        with pytest.raises(TypeError):
+            agentnanny._serialize_toml_value({"key": "val"})
+
+
+class TestPatchCodexConfig:
+    def test_creates_config_file(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._patch_codex_config({"approval_policy": "on-request"})
+
+        assert config_path.exists()
+        content = config_path.read_text(encoding="utf-8")
+        assert 'approval_policy = "on-request"' in content
+
+    def test_preserves_existing_keys(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('model = "o3"\n', encoding="utf-8")
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._patch_codex_config({"approval_policy": "never"})
+
+        content = config_path.read_text(encoding="utf-8")
+        assert 'model = "o3"' in content
+        assert 'approval_policy = "never"' in content
+
+    def test_replaces_existing_key(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('approval_policy = "on-request"\n', encoding="utf-8")
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._patch_codex_config({"approval_policy": "never"})
+
+        content = config_path.read_text(encoding="utf-8")
+        assert 'approval_policy = "never"' in content
+        assert "on-request" not in content
+
+    def test_preserves_comments(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('# My config\nmodel = "o3"\n', encoding="utf-8")
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._patch_codex_config({"notify": ["python3", "agentnanny.py"]})
+
+        content = config_path.read_text(encoding="utf-8")
+        assert "# My config" in content
+        assert 'notify = ["python3", "agentnanny.py"]' in content
+
+    def test_writes_list_value(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._patch_codex_config({"notify": ["cmd", "arg1", "arg2"]})
+
+        content = config_path.read_text(encoding="utf-8")
+        assert 'notify = ["cmd", "arg1", "arg2"]' in content
+
+
+class TestRemoveCodexConfigKeys:
+    def test_removes_key(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('model = "o3"\napproval_policy = "never"\n', encoding="utf-8")
+
+        with patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            result = agentnanny._remove_codex_config_keys(["approval_policy"])
+
+        assert result is True
+        content = config_path.read_text(encoding="utf-8")
+        assert "approval_policy" not in content
+        assert 'model = "o3"' in content
+
+    def test_no_file_returns_false(self, tmp_path):
+        config_path = tmp_path / "nonexistent.toml"
+        with patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            result = agentnanny._remove_codex_config_keys(["approval_policy"])
+        assert result is False
+
+    def test_key_not_present(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('model = "o3"\n', encoding="utf-8")
+
+        with patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            result = agentnanny._remove_codex_config_keys(["approval_policy"])
+        assert result is False
+
+
+class TestPatternsToCodexRules:
+    def test_deny_bash_pattern(self):
+        rules = agentnanny._patterns_to_codex_rules(["Bash(rm -rf /*)"], "forbidden")
+        assert 'pattern=["rm -rf /"]' in rules
+        assert 'decision="forbidden"' in rules
+        assert 'justification="blocked by agentnanny"' in rules
+
+    def test_deny_alternation_pattern(self):
+        rules = agentnanny._patterns_to_codex_rules(["Bash(curl*|wget*)"], "forbidden")
+        assert 'pattern=["curl"]' in rules
+        assert 'pattern=["wget"]' in rules
+
+    def test_non_bash_skipped(self):
+        rules = agentnanny._patterns_to_codex_rules(["WebFetch", "Write"], "forbidden")
+        assert rules.strip() == ""
+
+    def test_deny_git_push_force(self):
+        rules = agentnanny._patterns_to_codex_rules(["Bash(git push --force*)"], "forbidden")
+        assert 'pattern=["git push --force"]' in rules
+        assert 'decision="forbidden"' in rules
+
+    def test_deny_mixed_patterns(self):
+        rules = agentnanny._patterns_to_codex_rules([
+            "Bash(rm -rf /*)",
+            "WebFetch",
+            "Bash(DROP TABLE*)",
+        ], "forbidden")
+        assert 'pattern=["rm -rf /"]' in rules
+        assert 'pattern=["DROP TABLE"]' in rules
+        assert "WebFetch" not in rules
+
+    def test_allow_bash_pattern(self):
+        rules = agentnanny._patterns_to_codex_rules(["Bash(ls*)"], "allow")
+        assert 'pattern=["ls"]' in rules
+        assert 'decision="allow"' in rules
+        assert 'justification="allowed by agentnanny"' in rules
+
+    def test_allow_git_commands(self):
+        rules = agentnanny._patterns_to_codex_rules([
+            "Bash(git log*)", "Bash(git diff*)", "Bash(git show*)",
+        ], "allow")
+        assert 'pattern=["git log"]' in rules
+        assert 'pattern=["git diff"]' in rules
+        assert 'pattern=["git show"]' in rules
+
+    def test_allow_non_bash_skipped(self):
+        rules = agentnanny._patterns_to_codex_rules(["Read", "Glob", "Grep"], "allow")
+        assert rules.strip() == ""
+
+    def test_allow_alternation(self):
+        rules = agentnanny._patterns_to_codex_rules(["Bash(cat*|head*)"], "allow")
+        assert 'pattern=["cat"]' in rules
+        assert 'pattern=["head"]' in rules
+
+
+class TestWriteRemoveCodexRules:
+    def test_write_creates_file(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        with patch.object(agentnanny, "CODEX_HOME", codex_home):
+            path = agentnanny._write_codex_rules("abc12345", "# test rules\n")
+
+        assert path.exists()
+        assert path.name == "agentnanny-abc12345.rules"
+        assert path.read_text(encoding="utf-8") == "# test rules\n"
+
+    def test_remove_deletes_file(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        rules_dir = codex_home / "rules"
+        rules_dir.mkdir(parents=True)
+        rules_file = rules_dir / "agentnanny-abc12345.rules"
+        rules_file.write_text("# test\n", encoding="utf-8")
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home):
+            result = agentnanny._remove_codex_rules("abc12345")
+
+        assert result is True
+        assert not rules_file.exists()
+
+    def test_remove_nonexistent(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        with patch.object(agentnanny, "CODEX_HOME", codex_home):
+            result = agentnanny._remove_codex_rules("abc12345")
+        assert result is False
+
+    def test_remove_all(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        rules_dir = codex_home / "rules"
+        rules_dir.mkdir(parents=True)
+        (rules_dir / "agentnanny-abc12345.rules").write_text("# 1\n")
+        (rules_dir / "agentnanny-def67890.rules").write_text("# 2\n")
+        (rules_dir / "other.rules").write_text("# 3\n")
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home):
+            count = agentnanny._remove_all_codex_rules()
+
+        assert count == 2
+        assert (rules_dir / "other.rules").exists()
+
+
+class TestInstallUninstallCodex:
+    def test_install_creates_notify(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny.install_codex_hooks()
+
+        content = config_path.read_text(encoding="utf-8")
+        assert "agentnanny" in content
+        assert "codex-hook" in content
+        assert content.startswith("notify = [")
+
+    def test_install_idempotent(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny.install_codex_hooks()
+            with pytest.raises(SystemExit):
+                agentnanny.install_codex_hooks()
+
+    def test_install_preserves_existing(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('model = "o3"\n', encoding="utf-8")
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny.install_codex_hooks()
+
+        content = config_path.read_text(encoding="utf-8")
+        assert 'model = "o3"' in content
+        assert "agentnanny" in content
+
+    def test_uninstall_removes_notify(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny.install_codex_hooks()
+            agentnanny.uninstall_codex_hooks()
+
+        content = config_path.read_text(encoding="utf-8")
+        assert "notify" not in content
+
+    def test_uninstall_no_config_exits(self, tmp_path):
+        config_path = tmp_path / "nonexistent.toml"
+        with patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            with pytest.raises(SystemExit):
+                agentnanny.uninstall_codex_hooks()
+
+    def test_uninstall_removes_rules_files(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+        rules_dir = codex_home / "rules"
+        rules_dir.mkdir(parents=True)
+        (rules_dir / "agentnanny-abc12345.rules").write_text("# test\n")
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny.install_codex_hooks()
+            agentnanny.uninstall_codex_hooks()
+
+        assert not (rules_dir / "agentnanny-abc12345.rules").exists()
+
+
+class TestCodexHook:
+    def test_logs_shell_command(self, tmp_path):
+        event = {
+            "tool_name": "shell_command",
+            "tool_input": {"command": ["ls", "-la", "/tmp"]},
+        }
+        stdin = StringIO(json.dumps(event))
+        cfg = {"hooks": {}, "logging": {"audit_log": os.devnull, "level": "all"}}
+
+        with patch.object(sys, "stdin", stdin), \
+             patch.object(agentnanny, "load_config", return_value=cfg), \
+             patch.object(agentnanny, "audit_log") as mock_log:
+            agentnanny.handle_codex_hook()
+
+        mock_log.assert_called_once()
+        assert mock_log.call_args[0][0] == "codex-hook"
+        assert mock_log.call_args[0][1] == "executed"
+        assert mock_log.call_args[0][2] == "shell_command"
+        assert "ls -la /tmp" in mock_log.call_args[0][3]
+
+    def test_handles_string_command(self, tmp_path):
+        event = {
+            "tool_name": "apply_patch",
+            "tool_input": {"command": "patch content"},
+        }
+        stdin = StringIO(json.dumps(event))
+        cfg = {"hooks": {}, "logging": {"audit_log": os.devnull, "level": "all"}}
+
+        with patch.object(sys, "stdin", stdin), \
+             patch.object(agentnanny, "load_config", return_value=cfg), \
+             patch.object(agentnanny, "audit_log") as mock_log:
+            agentnanny.handle_codex_hook()
+
+        assert mock_log.call_args[0][3] == "patch content"
+
+
+class TestApplyRemoveCodexSession:
+    def _make_cfg(self):
+        return {
+            "hooks": {},
+            "groups": dict(agentnanny.BUILTIN_GROUPS),
+            "profiles": {k: dict(v) for k, v in agentnanny.BUILTIN_PROFILES.items()},
+            "logging": {"audit_log": os.devnull},
+        }
+
+    def test_apply_sets_approval_policy(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+        cfg = self._make_cfg()
+        policy = {
+            "_profile_name": "safe-dev",
+            "deny": [],
+            "allow_groups": ["filesystem", "safe-shell"],
+            "allow_tools": [],
+        }
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._apply_codex_session(policy, cfg, "abc12345")
+
+        content = config_path.read_text(encoding="utf-8")
+        assert 'approval_policy = "unless-trusted"' in content
+
+    def test_apply_generates_deny_rules(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+        cfg = self._make_cfg()
+        policy = {
+            "_profile_name": "full-dev",
+            "deny": ["Bash(rm -rf /*)", "Bash(git push --force*)"],
+            "allow_groups": ["filesystem", "shell"],
+            "allow_tools": [],
+        }
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._apply_codex_session(policy, cfg, "abc12345")
+
+        rules_path = codex_home / "rules" / "agentnanny-abc12345.rules"
+        assert rules_path.exists()
+        content = rules_path.read_text(encoding="utf-8")
+        assert 'pattern=["rm -rf /"]' in content
+        assert 'pattern=["git push --force"]' in content
+        assert 'decision="forbidden"' in content
+
+    def test_apply_generates_allow_rules(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+        cfg = self._make_cfg()
+        policy = {
+            "_profile_name": "reviewer",
+            "deny": [],
+            "allow_groups": ["review-shell"],
+            "allow_tools": [],
+        }
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._apply_codex_session(policy, cfg, "abc12345")
+
+        rules_path = codex_home / "rules" / "agentnanny-abc12345.rules"
+        assert rules_path.exists()
+        content = rules_path.read_text(encoding="utf-8")
+        assert 'pattern=["git log"]' in content
+        assert 'decision="allow"' in content
+
+    def test_remove_cleans_up(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('approval_policy = "never"\n', encoding="utf-8")
+        rules_dir = codex_home / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "agentnanny-abc12345.rules").write_text("# test\n")
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._remove_codex_session("abc12345")
+
+        assert not (rules_dir / "agentnanny-abc12345.rules").exists()
+        content = config_path.read_text(encoding="utf-8")
+        assert "approval_policy" not in content
+
+    def test_unknown_profile_defaults_on_request(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+        cfg = self._make_cfg()
+        policy = {
+            "deny": [],
+            "allow_groups": [],
+            "allow_tools": ["Bash"],
+        }
+
+        with patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            agentnanny._apply_codex_session(policy, cfg, "abc12345")
+
+        content = config_path.read_text(encoding="utf-8")
+        assert 'approval_policy = "on-request"' in content
+
+
+class TestActivateDeactivateCodex:
+    def test_activate_codex_target(self, tmp_path, capsys):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "config.toml"
+        cfg = {
+            "hooks": {},
+            "groups": dict(agentnanny.BUILTIN_GROUPS),
+            "profiles": {k: dict(v) for k, v in agentnanny.BUILTIN_PROFILES.items()},
+            "logging": {"audit_log": os.devnull},
+        }
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path / "sessions"), \
+             patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path), \
+             patch.object(agentnanny, "load_config", return_value=cfg):
+            agentnanny.cmd_activate("safe-dev", None, None, None, "8h", target="codex")
+
+        out = capsys.readouterr().out
+        assert "export AGENTNANNY_SCOPE=" in out
+        assert config_path.exists()
+        content = config_path.read_text(encoding="utf-8")
+        assert "unless-trusted" in content
+
+    def test_deactivate_codex_target(self, tmp_path, capsys):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('approval_policy = "never"\n', encoding="utf-8")
+        rules_dir = codex_home / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "agentnanny-dea01234.rules").write_text("# test\n")
+
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path / "sessions"), \
+             patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path):
+            (tmp_path / "sessions").mkdir()
+            agentnanny.save_session_policy({
+                "scope_id": "dea01234",
+                "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "ttl_seconds": 0,
+                "allow_groups": [],
+                "allow_tools": [],
+                "deny": [],
+            })
+            agentnanny.cmd_deactivate("dea01234", target="codex")
+
+        out = capsys.readouterr().out
+        assert "unset AGENTNANNY_SCOPE" in out
+        assert not (rules_dir / "agentnanny-dea01234.rules").exists()
+
+
+class TestCodexApprovalMap:
+    def test_all_builtin_profiles_mapped(self):
+        for name in agentnanny.BUILTIN_PROFILES:
+            assert name in agentnanny.CODEX_APPROVAL_MAP, \
+                f"Profile {name!r} missing from CODEX_APPROVAL_MAP"
+
+    def test_values_are_valid_codex_policies(self):
+        valid = {"never", "on-failure", "on-request", "unless-trusted"}
+        for name, policy in agentnanny.CODEX_APPROVAL_MAP.items():
+            assert policy in valid, f"{name} maps to invalid policy {policy!r}"
+
+
+class TestBuildPolicy:
+    def test_includes_profile_name(self):
+        cfg = {
+            "hooks": {},
+            "groups": dict(agentnanny.BUILTIN_GROUPS),
+            "profiles": {k: dict(v) for k, v in agentnanny.BUILTIN_PROFILES.items()},
+        }
+        policy, scope_id = agentnanny._build_policy("safe-dev", None, None, None, "1h", cfg)
+        assert policy["_profile_name"] == "safe-dev"
+        assert policy["ttl_seconds"] == 3600
+
+    def test_no_profile_no_key(self):
+        cfg = {"hooks": {}, "groups": {}, "profiles": {}}
+        policy, _ = agentnanny._build_policy(None, None, "Bash", None, "0", cfg)
+        assert "_profile_name" not in policy
+
+    def test_merges_groups_and_tools(self):
+        cfg = {
+            "hooks": {},
+            "groups": {"shell": ["Bash"], "read-only": ["Read", "Glob", "Grep"]},
+            "profiles": {},
+        }
+        policy, _ = agentnanny._build_policy(None, "shell,read-only", "Write", None, "0", cfg)
+        assert policy["allow_groups"] == ["shell", "read-only"]
+        assert policy["allow_tools"] == ["Write"]
+
+
+class TestCodexStatus:
+    def test_shows_codex_section(self, tmp_path, capsys):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text(
+            'notify = ["python3", "agentnanny.py", "codex-hook"]\n'
+            'approval_policy = "never"\n',
+            encoding="utf-8",
+        )
+
+        with patch.object(agentnanny, "SETTINGS_PATH", tmp_path / "nonexistent.json"), \
+             patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path), \
+             patch.object(agentnanny, "SESSION_DIR", tmp_path / "sessions"), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENTNANNY_SCOPE", None)
+            agentnanny.show_status()
+
+        err = capsys.readouterr().out
+        assert "Codex CLI" in err
+        assert "Notify hook installed: yes" in err
+        assert "Approval policy: never" in err
+
+    def test_shows_codex_not_installed(self, tmp_path, capsys):
+        codex_home = tmp_path / ".codex"
+        config_path = codex_home / "nonexistent.toml"
+
+        with patch.object(agentnanny, "SETTINGS_PATH", tmp_path / "nonexistent.json"), \
+             patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path), \
+             patch.object(agentnanny, "SESSION_DIR", tmp_path / "sessions"), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENTNANNY_SCOPE", None)
+            agentnanny.show_status()
+
+        err = capsys.readouterr().out
+        assert "Notify hook installed: no" in err
+
+    def test_shows_rules_count(self, tmp_path, capsys):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config_path = codex_home / "config.toml"
+        config_path.write_text('model = "o3"\n', encoding="utf-8")
+        rules_dir = codex_home / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "agentnanny-abc12345.rules").write_text("# 1\n")
+        (rules_dir / "agentnanny-def67890.rules").write_text("# 2\n")
+
+        with patch.object(agentnanny, "SETTINGS_PATH", tmp_path / "nonexistent.json"), \
+             patch.object(agentnanny, "CODEX_HOME", codex_home), \
+             patch.object(agentnanny, "CODEX_CONFIG_PATH", config_path), \
+             patch.object(agentnanny, "SESSION_DIR", tmp_path / "sessions"), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENTNANNY_SCOPE", None)
+            agentnanny.show_status()
+
+        err = capsys.readouterr().out
+        assert "Exec policy rules: 2 file(s)" in err

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agentnanny — auto-approve Claude Code permission prompts via hooks + tmux daemon."""
+"""agentnanny — granular permission manager for Claude Code and Codex CLI."""
 
 from __future__ import annotations
 
@@ -30,6 +30,22 @@ SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CLAUDE_JSON_PATH = Path.home() / ".claude.json"
 PID_FILE = Path("/tmp/agentnanny.pid") if sys.platform != "win32" else Path(os.environ.get("TEMP", "/tmp")) / "agentnanny.pid"
 SESSION_DIR = Path(tempfile.gettempdir()) / "agentnanny" / "sessions"
+
+# Codex CLI paths
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CODEX_CONFIG_PATH = CODEX_HOME / "config.toml"
+
+# Supported targets
+TARGETS = ("claude", "codex")
+
+# Map agentnanny profiles to Codex approval_policy values
+CODEX_APPROVAL_MAP: dict[str, str] = {
+    "reviewer": "unless-trusted",
+    "safe-dev": "unless-trusted",
+    "full-dev": "on-failure",
+    "overnight": "on-failure",
+    "ci-runner": "never",
+}
 
 # ---------------------------------------------------------------------------
 # Built-in groups and profiles (work without any config file)
@@ -492,7 +508,227 @@ def audit_log(source: str, action: str, tool_name: str, detail: str, cfg: dict |
 
 
 # ---------------------------------------------------------------------------
-# Mode 1: Hook handler
+# Codex CLI integration
+# ---------------------------------------------------------------------------
+
+
+def _serialize_toml_value(value: object) -> str:
+    """Serialize a Python value to a TOML-compatible string."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return f'"{value}"'
+    if isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, list):
+        items = ", ".join(_serialize_toml_value(v) for v in value)
+        return f"[{items}]"
+    raise TypeError(f"Unsupported TOML type: {type(value)}")
+
+
+def _patch_codex_config(updates: dict[str, object]) -> Path:
+    """Read ~/.codex/config.toml, apply key=value updates, write back.
+
+    Only touches top-level keys. Preserves existing content and comments
+    by replacing matching lines or appending new ones.
+    """
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    if CODEX_CONFIG_PATH.exists():
+        lines = CODEX_CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+
+    remaining = dict(updates)
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        matched = False
+        for key in list(remaining):
+            if stripped.startswith(f"{key} ") or stripped.startswith(f"{key}="):
+                new_lines.append(f"{key} = {_serialize_toml_value(remaining.pop(key))}")
+                matched = True
+                break
+        if not matched:
+            new_lines.append(line)
+
+    for key, val in remaining.items():
+        new_lines.append(f"{key} = {_serialize_toml_value(val)}")
+
+    content = "\n".join(new_lines) + "\n"
+    CODEX_CONFIG_PATH.write_text(content, encoding="utf-8")
+    return CODEX_CONFIG_PATH
+
+
+def _remove_codex_config_keys(keys: list[str]) -> bool:
+    """Remove specific top-level keys from ~/.codex/config.toml."""
+    if not CODEX_CONFIG_PATH.exists():
+        return False
+    lines = CODEX_CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+    new_lines = []
+    removed = False
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(f"{k} ") or stripped.startswith(f"{k}=") for k in keys):
+            removed = True
+            continue
+        new_lines.append(line)
+    if removed:
+        CODEX_CONFIG_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return removed
+
+
+_BASH_PATTERN_RE = re.compile(r'^Bash\((.+)\)$')
+
+
+def _patterns_to_codex_rules(patterns: list[str], decision: str) -> str:
+    """Convert agentnanny Bash patterns to Codex Starlark exec policy rules.
+
+    Only Bash(...) patterns translate — non-Bash tool patterns are skipped
+    since Codex controls file operations via approval_policy, not exec rules.
+    Returns empty string when no patterns match.
+    """
+    if decision not in ("forbidden", "allow"):
+        raise ValueError(f"Invalid codex rule decision: {decision!r}")
+    justification = "blocked" if decision == "forbidden" else "allowed"
+    rules: list[str] = []
+    for pattern in patterns:
+        m = _BASH_PATTERN_RE.match(pattern)
+        if not m:
+            continue
+        for segment in m.group(1).split("|"):
+            prefix = segment.rstrip("*").rstrip()
+            if prefix:
+                rules.append(
+                    f'prefix_rule(pattern=["{prefix}"], decision="{decision}",'
+                    f' justification="{justification} by agentnanny")'
+                )
+    return "\n".join(rules)
+
+
+def _write_codex_rules(scope_id: str, content: str) -> Path:
+    """Write an exec policy rules file for the given scope."""
+    rules_dir = CODEX_HOME / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    path = rules_dir / f"agentnanny-{scope_id}.rules"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _remove_codex_rules(scope_id: str) -> bool:
+    """Remove the exec policy rules file for the given scope."""
+    path = CODEX_HOME / "rules" / f"agentnanny-{scope_id}.rules"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def _remove_all_codex_rules() -> int:
+    """Remove all agentnanny-generated exec policy rules files."""
+    rules_dir = CODEX_HOME / "rules"
+    if not rules_dir.exists():
+        return 0
+    count = 0
+    for path in rules_dir.glob("agentnanny-*.rules"):
+        path.unlink()
+        count += 1
+    return count
+
+
+def install_codex_hooks():
+    """Register agentnanny as a notify handler in ~/.codex/config.toml."""
+    if CODEX_CONFIG_PATH.exists():
+        if HOOK_MARKER in CODEX_CONFIG_PATH.read_text(encoding="utf-8"):
+            print(f"Already installed in {CODEX_CONFIG_PATH}", file=sys.stderr)
+            raise SystemExit(1)
+
+    python_cmd = sys.executable.replace("\\", "/")
+    script_path = str(SCRIPT_PATH).replace("\\", "/")
+    notify_argv = [python_cmd, script_path, "codex-hook"]
+
+    _patch_codex_config({"notify": notify_argv})
+    print(f"Installed notify hook in {CODEX_CONFIG_PATH}")
+
+
+def uninstall_codex_hooks():
+    """Remove agentnanny notify handler from ~/.codex/config.toml."""
+    if not CODEX_CONFIG_PATH.exists():
+        print("No Codex config file found", file=sys.stderr)
+        raise SystemExit(1)
+
+    removed = _remove_codex_config_keys(["notify"])
+    if not removed:
+        print("No agentnanny hooks found in Codex config", file=sys.stderr)
+        raise SystemExit(1)
+
+    count = _remove_all_codex_rules()
+    print(f"Removed agentnanny hooks from {CODEX_CONFIG_PATH}")
+    if count:
+        print(f"Removed {count} exec policy rules file(s)")
+
+
+def handle_codex_hook():
+    """Codex notify hook handler. Receives tool execution info for audit logging."""
+    event = json.load(sys.stdin)
+    tool_name = event.get("tool_name", "")
+    tool_input = event.get("tool_input", {})
+
+    cfg = load_config()
+    detail = ""
+    if isinstance(tool_input, dict):
+        # Codex LocalShell input has a command array
+        cmd = tool_input.get("command", [])
+        if isinstance(cmd, list):
+            detail = " ".join(cmd)[:200]
+        else:
+            detail = str(cmd)[:200]
+    audit_log("codex-hook", "executed", tool_name, detail, cfg)
+
+
+def _apply_codex_session(policy: dict, cfg: dict, scope_id: str):
+    """Apply an agentnanny session policy to Codex config and rules."""
+    # Determine approval_policy from profile or groups
+    profile_name = policy.get("_profile_name")
+    approval = CODEX_APPROVAL_MAP.get(profile_name or "", "on-request")
+
+    updates: dict[str, object] = {"approval_policy": approval}
+    _patch_codex_config(updates)
+
+    # Generate exec policy rules from deny + allow patterns
+    deny_patterns = policy.get("deny", [])
+    allow_groups = policy.get("allow_groups", [])
+    allow_tools = policy.get("allow_tools", [])
+
+    allow_patterns: list[str] = list(allow_tools)
+    if allow_groups:
+        try:
+            allow_patterns.extend(resolve_groups(allow_groups, cfg))
+        except ValueError as exc:
+            print(f"Warning: {exc}", file=sys.stderr)
+
+    deny_rules = _patterns_to_codex_rules(deny_patterns, "forbidden")
+    allow_rules = _patterns_to_codex_rules(allow_patterns, "allow")
+
+    if deny_rules or allow_rules:
+        rules_parts = ["# Generated by agentnanny — do not edit manually"]
+        if deny_rules:
+            rules_parts.append(deny_rules)
+        if allow_rules:
+            rules_parts.append(allow_rules)
+        content = "\n".join(rules_parts) + "\n"
+        path = _write_codex_rules(scope_id, content)
+        print(f"# Codex rules: {path}", file=sys.stderr)
+
+    print(f"# Codex approval_policy: {approval}", file=sys.stderr)
+
+
+def _remove_codex_session(scope_id: str):
+    """Remove Codex artifacts for a session."""
+    _remove_codex_rules(scope_id)
+    _remove_codex_config_keys(["approval_policy"])
+
+
+# ---------------------------------------------------------------------------
+# Mode 1: Hook handler (Claude Code)
 # ---------------------------------------------------------------------------
 
 
@@ -575,8 +811,8 @@ def handle_hook():
     if group_names:
         try:
             allow_patterns.extend(resolve_groups(group_names, cfg))
-        except ValueError:
-            pass  # Unknown group — don't crash the hook
+        except ValueError as exc:
+            print(f"Warning: {exc}", file=sys.stderr)
 
     if matches_allow(tool_name, tool_input, allow_patterns):
         detail = _primary_input(tool_name, tool_input)[:200]
@@ -1097,6 +1333,28 @@ def show_status():
     if policies:
         print(f"Session policies: {len(policies)} active")
 
+    # Codex status
+    print()
+    print("─── Codex CLI ───")
+    if CODEX_CONFIG_PATH.exists():
+        codex_text = CODEX_CONFIG_PATH.read_text(encoding="utf-8")
+        codex_installed = HOOK_MARKER in codex_text
+        print(f"Notify hook installed: {'yes' if codex_installed else 'no'}")
+        print(f"Config: {CODEX_CONFIG_PATH}")
+        # Parse approval_policy from config
+        codex_cfg = parse_toml(codex_text)
+        ap = codex_cfg.get("approval_policy")
+        if ap:
+            print(f"Approval policy: {ap}")
+    else:
+        print("Notify hook installed: no (no config file)")
+
+    rules_dir = CODEX_HOME / "rules"
+    if rules_dir.exists():
+        rules_files = list(rules_dir.glob("agentnanny-*.rules"))
+        if rules_files:
+            print(f"Exec policy rules: {len(rules_files)} file(s)")
+
 
 def show_log(
     lines_count: int = 50,
@@ -1179,12 +1437,10 @@ def _parse_ttl(ttl_str: str) -> int:
     return int(ttl_str)
 
 
-def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
-                 deny: str | None, ttl: str | None):
-    """Create a session policy and print the env export command."""
-    cfg = load_config()
-
-    # Start from profile defaults if specified
+def _build_policy(profile: str | None, groups: str | None, tools: str | None,
+                  deny: str | None, ttl: str | None,
+                  cfg: dict) -> tuple[dict, str]:
+    """Build a session policy dict from CLI args. Returns (policy, scope_id)."""
     if profile:
         p = resolve_profile(profile, cfg)
         base_groups = p["groups"]
@@ -1195,17 +1451,14 @@ def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
         base_deny = []
         base_ttl = "0"
 
-    # CLI flags merge on top of profile
     group_names = base_groups + ([g.strip() for g in groups.split(",")] if groups else [])
     tool_names = [t.strip() for t in tools.split(",")] if tools else []
     deny_patterns = base_deny + ([d.strip() for d in deny.split(",")] if deny else [])
     ttl_seconds = _parse_ttl(ttl if ttl is not None else base_ttl)
 
-    # Validate group names
     if group_names:
         resolve_groups(group_names, cfg)
 
-    # Validate deny pattern syntax
     for pat in deny_patterns:
         m_pat = re.match(r'^(\w+)\((.+)\)$', pat)
         if m_pat:
@@ -1214,7 +1467,6 @@ def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
             except re.error as exc:
                 raise ValueError(f"Invalid deny pattern {pat!r}: {exc}") from exc
         else:
-            # Plain pattern is used as regex in fullmatch — validate it
             try:
                 re.compile(pat)
             except re.error as exc:
@@ -1229,6 +1481,22 @@ def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
         "allow_tools": tool_names,
         "deny": deny_patterns,
     }
+    if profile:
+        policy["_profile_name"] = profile
+    return policy, scope_id
+
+
+def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
+                 deny: str | None, ttl: str | None, target: str = "claude"):
+    """Create a session policy and print the env export command."""
+    cfg = load_config()
+    policy, scope_id = _build_policy(profile, groups, tools, deny, ttl, cfg)
+
+    group_names = policy["allow_groups"]
+    tool_names = policy["allow_tools"]
+    deny_patterns = policy["deny"]
+    ttl_seconds = policy["ttl_seconds"]
+
     path = save_session_policy(policy)
     print(f"export AGENTNANNY_SCOPE={scope_id}")
     print(f"# Policy: {path}", file=sys.stderr)
@@ -1240,6 +1508,9 @@ def cmd_activate(profile: str | None, groups: str | None, tools: str | None,
         print(f"# Deny: {', '.join(deny_patterns)}", file=sys.stderr)
     if ttl_seconds:
         print(f"# TTL: {ttl_seconds}s", file=sys.stderr)
+
+    if target == "codex":
+        _apply_codex_session(policy, cfg, scope_id)
 
 
 def cmd_extend(scope_id: str | None, groups: str | None, tools: str | None,
@@ -1302,7 +1573,7 @@ def cmd_extend(scope_id: str | None, groups: str | None, tools: str | None,
     print(f"# Deny: {', '.join(existing_deny)}", file=sys.stderr)
 
 
-def cmd_deactivate(scope_id: str | None):
+def cmd_deactivate(scope_id: str | None, target: str = "claude"):
     """Remove a session policy."""
     scope_id = scope_id or os.environ.get("AGENTNANNY_SCOPE")
     if not scope_id:
@@ -1314,18 +1585,21 @@ def cmd_deactivate(scope_id: str | None):
     if delete_session_policy(scope_id):
         print(f"unset AGENTNANNY_SCOPE")
         print(f"# Removed session {scope_id}", file=sys.stderr)
+        if target == "codex":
+            _remove_codex_session(scope_id)
+            print("# Removed Codex exec policy rules", file=sys.stderr)
     else:
         print(f"No session policy found for {scope_id}", file=sys.stderr)
         raise SystemExit(1)
 
 
 def cmd_run(profile: str | None, groups: str | None, tools: str | None,
-            deny: str | None, ttl: str | None, command_args: list[str]):
+            deny: str | None, ttl: str | None, command_args: list[str],
+            target: str = "claude"):
     """Run a command with session-scoped permissions."""
     if not command_args:
         print("No command specified", file=sys.stderr)
         raise SystemExit(1)
-    # Strip leading -- if present
     if command_args and command_args[0] == "--":
         command_args = command_args[1:]
     if not command_args:
@@ -1333,46 +1607,22 @@ def cmd_run(profile: str | None, groups: str | None, tools: str | None,
         raise SystemExit(1)
 
     cfg = load_config()
-
-    # Start from profile defaults if specified
-    if profile:
-        p = resolve_profile(profile, cfg)
-        base_groups = p["groups"]
-        base_deny = p["deny"]
-        base_ttl = p["ttl"]
-    else:
-        base_groups = []
-        base_deny = []
-        base_ttl = "0"
-
-    # CLI flags merge on top of profile
-    group_names = base_groups + ([g.strip() for g in groups.split(",")] if groups else [])
-    tool_names = [t.strip() for t in tools.split(",")] if tools else []
-    deny_patterns = base_deny + ([d.strip() for d in deny.split(",")] if deny else [])
-    ttl_seconds = _parse_ttl(ttl if ttl is not None else base_ttl)
-
-    if group_names:
-        resolve_groups(group_names, cfg)
-
-    scope_id = generate_scope_id()
-    policy = {
-        "scope_id": scope_id,
-        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "ttl_seconds": ttl_seconds,
-        "allow_groups": group_names,
-        "allow_tools": tool_names,
-        "deny": deny_patterns,
-    }
+    policy, scope_id = _build_policy(profile, groups, tools, deny, ttl, cfg)
     save_session_policy(policy)
 
     env = os.environ.copy()
     env["AGENTNANNY_SCOPE"] = scope_id
+
+    if target == "codex":
+        _apply_codex_session(policy, cfg, scope_id)
 
     try:
         result = subprocess.run(command_args, env=env)
         raise SystemExit(result.returncode)
     finally:
         delete_session_policy(scope_id)
+        if target == "codex":
+            _remove_codex_session(scope_id)
 
 
 PROJECT_CONFIG_TEMPLATE = """\
@@ -1571,8 +1821,8 @@ def evaluate_policy(
     if group_names:
         try:
             allow_patterns.extend(resolve_groups(group_names, cfg))
-        except ValueError:
-            pass
+        except ValueError as exc:
+            return ("passthrough", f"group resolution failed: {exc}")
 
     if matches_allow(tool_name, tool_input, allow_patterns):
         return ("allow", f"{tool_name} allowed by session policy (scope {scope_id})")
@@ -1597,14 +1847,20 @@ def cmd_test_policy(tool_name: str, tool_input_json: str, scope: str | None):
 def main():
     parser = argparse.ArgumentParser(
         prog="agentnanny",
-        description="Auto-approve Claude Code permission prompts via hooks + tmux daemon.",
+        description="Granular permission manager for Claude Code and Codex CLI.",
     )
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("hook", help="Hook handler (called by Claude Code, not user)")
     sub.add_parser("post-hook", help="PostToolUse hook handler (called by Claude Code, not user)")
-    sub.add_parser("install", help="Register hooks in ~/.claude/settings.json")
-    sub.add_parser("uninstall", help="Remove hooks from ~/.claude/settings.json")
+    sub.add_parser("codex-hook", help="Notify handler (called by Codex CLI, not user)")
+
+    p_install = sub.add_parser("install", help="Register hooks in agent config")
+    p_install.add_argument("--target", choices=TARGETS, default="claude",
+                           help="Target agent (default: claude)")
+    p_uninstall = sub.add_parser("uninstall", help="Remove hooks from agent config")
+    p_uninstall.add_argument("--target", choices=TARGETS, default="claude",
+                             help="Target agent (default: claude)")
 
     p_trust = sub.add_parser("trust", help="Pre-trust a directory")
     p_trust.add_argument("directory", nargs="?", default=".", help="Directory to trust (default: .)")
@@ -1627,9 +1883,13 @@ def main():
     p_activate.add_argument("--tools", "-t", default=None, help="Comma-separated tool names")
     p_activate.add_argument("--deny", "-d", default=None, help="Comma-separated deny patterns")
     p_activate.add_argument("--ttl", default=None, help="TTL (e.g. 8h, 30m, 3600)")
+    p_activate.add_argument("--target", choices=TARGETS, default="claude",
+                            help="Target agent (default: claude)")
 
     p_deactivate = sub.add_parser("deactivate", help="Remove a session policy")
     p_deactivate.add_argument("scope_id", nargs="?", default=None, help="Scope ID (default: from AGENTNANNY_SCOPE)")
+    p_deactivate.add_argument("--target", choices=TARGETS, default="claude",
+                              help="Target agent (default: claude)")
 
     p_extend = sub.add_parser("extend", help="Add groups, tools, or deny patterns to an existing session")
     p_extend.add_argument("scope_id", nargs="?", default=None, help="Scope ID (default: from AGENTNANNY_SCOPE)")
@@ -1643,6 +1903,8 @@ def main():
     p_run.add_argument("--tools", "-t", default=None, help="Comma-separated tool names")
     p_run.add_argument("--deny", "-d", default=None, help="Comma-separated deny patterns")
     p_run.add_argument("--ttl", default=None, help="TTL (e.g. 8h, 30m, 3600)")
+    p_run.add_argument("--target", choices=TARGETS, default="claude",
+                        help="Target agent (default: claude)")
     p_run.add_argument("command_args", nargs=argparse.REMAINDER, help="Command to run (after --)")
 
     sub.add_parser("profiles", help="List available profiles")
@@ -1664,10 +1926,18 @@ def main():
         handle_hook()
     elif args.command == "post-hook":
         handle_post_hook()
+    elif args.command == "codex-hook":
+        handle_codex_hook()
     elif args.command == "install":
-        install_hooks()
+        if args.target == "codex":
+            install_codex_hooks()
+        else:
+            install_hooks()
     elif args.command == "uninstall":
-        uninstall_hooks()
+        if args.target == "codex":
+            uninstall_codex_hooks()
+        else:
+            uninstall_hooks()
     elif args.command == "trust":
         trust_directory(args.directory)
     elif args.command == "watch":
@@ -1686,13 +1956,13 @@ def main():
             filter_action=args.action,
         )
     elif args.command == "activate":
-        cmd_activate(args.profile, args.groups, args.tools, args.deny, args.ttl)
+        cmd_activate(args.profile, args.groups, args.tools, args.deny, args.ttl, args.target)
     elif args.command == "deactivate":
-        cmd_deactivate(args.scope_id)
+        cmd_deactivate(args.scope_id, args.target)
     elif args.command == "extend":
         cmd_extend(args.scope_id, args.groups, args.tools, args.deny)
     elif args.command == "run":
-        cmd_run(args.profile, args.groups, args.tools, args.deny, args.ttl, args.command_args)
+        cmd_run(args.profile, args.groups, args.tools, args.deny, args.ttl, args.command_args, args.target)
     elif args.command == "profiles":
         cmd_list_profiles()
     elif args.command == "sessions":
