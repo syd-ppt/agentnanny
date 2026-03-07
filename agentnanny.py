@@ -811,8 +811,8 @@ def handle_hook():
     if group_names:
         try:
             allow_patterns.extend(resolve_groups(group_names, cfg))
-        except ValueError:
-            pass  # Unknown group — don't crash the hook
+        except ValueError as exc:
+            print(f"Warning: {exc}", file=sys.stderr)
 
     if matches_allow(tool_name, tool_input, allow_patterns):
         detail = _primary_input(tool_name, tool_input)[:200]
@@ -1821,8 +1821,8 @@ def evaluate_policy(
     if group_names:
         try:
             allow_patterns.extend(resolve_groups(group_names, cfg))
-        except ValueError:
-            pass
+        except ValueError as exc:
+            return ("passthrough", f"group resolution failed: {exc}")
 
     if matches_allow(tool_name, tool_input, allow_patterns):
         return ("allow", f"{tool_name} allowed by session policy (scope {scope_id})")
