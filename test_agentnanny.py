@@ -1747,6 +1747,47 @@ class TestRunWrapper:
         assert result["completion"]["criteria"] == []
         assert result["completion"]["pattern"] is None
 
+    def test_run_codex_uses_codex_runner(self, tmp_path):
+        cfg = {"hooks": {}, "groups": {}, "logging": {"audit_log": os.devnull}}
+        fake_result = {
+            "return_code": 7,
+            "startup_prompt_seen": True,
+            "completion": {"matched": True, "pattern": "done", "criteria_count": 1, "criteria": ["done"]},
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "ended_at": "2026-01-01T00:00:01+00:00",
+            "output_length": 42,
+        }
+        captured = {}
+
+        def fake_run_codex_session(args, env, completion=None, working_directory=None):
+            captured["args"] = args
+            captured["env"] = env.copy()
+            captured["completion"] = completion
+            captured["working_directory"] = working_directory
+            return fake_result
+
+        def fake_apply(_policy, _cfg, scope_id):
+            captured["applied"] = scope_id
+
+        def fake_remove(scope_id):
+            captured["removed"] = scope_id
+
+        with patch.object(agentnanny, "SESSION_DIR", tmp_path), \
+             patch.object(agentnanny, "load_config", return_value=cfg), \
+             patch.object(agentnanny, "_apply_codex_session", fake_apply), \
+             patch.object(agentnanny, "_remove_codex_session", fake_remove), \
+             patch.object(agentnanny, "run_codex_session", fake_run_codex_session), \
+             pytest.raises(SystemExit) as exc_info:
+            agentnanny.cmd_run(None, None, None, None, None, ["--", "codex", "run"], "done", "codex")
+
+        assert exc_info.value.code == 7
+        scope_id = captured["env"]["AGENTNANNY_SCOPE"]
+        assert captured["args"] == ["codex", "run"]
+        assert captured["completion"] == "done"
+        assert captured["working_directory"] == str(Path.cwd())
+        assert captured["applied"] == scope_id
+        assert captured["removed"] == scope_id
+
     def test_run_sets_env_and_cleans_up(self, tmp_path):
         cfg = {"hooks": {}, "groups": {}, "logging": {"audit_log": os.devnull}}
         captured_env = {}

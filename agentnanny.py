@@ -1857,7 +1857,7 @@ def cmd_deactivate(scope_id: str | None, target: str = "claude"):
 
 def cmd_run(profile: str | None, groups: str | None, tools: str | None,
             deny: str | None, ttl: str | None, command_args: list[str],
-            target: str = "claude"):
+            completion: str | None = None, target: str = "claude"):
     """Run a command with session-scoped permissions."""
     if not command_args:
         print("No command specified", file=sys.stderr)
@@ -1879,6 +1879,17 @@ def cmd_run(profile: str | None, groups: str | None, tools: str | None,
         _apply_codex_session(policy, cfg, scope_id)
 
     try:
+        if target == "codex":
+            result = run_codex_session(
+                command_args,
+                env,
+                completion=completion,
+                working_directory=str(Path.cwd()),
+            )
+            if completion is not None:
+                print(json.dumps(result))
+            raise SystemExit(result["return_code"])
+
         result = subprocess.run(command_args, env=env)
         raise SystemExit(result.returncode)
     finally:
@@ -2168,6 +2179,8 @@ def main():
     p_run.add_argument("--ttl", default=None, help="TTL (e.g. 8h, 30m, 3600)")
     p_run.add_argument("--target", choices=TARGETS, default="claude",
                         help="Target agent (default: claude)")
+    p_run.add_argument("--completion", default=None,
+                       help="Comma-separated regex criteria for Codex completion")
     p_run.add_argument("command_args", nargs=argparse.REMAINDER, help="Command to run (after --)")
 
     sub.add_parser("profiles", help="List available profiles")
@@ -2232,6 +2245,7 @@ def main():
             args.deny,
             args.ttl,
             args.command_args,
+            args.completion,
             args.target,
         )
     elif args.command == "profiles":
