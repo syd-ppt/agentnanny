@@ -1201,6 +1201,113 @@ def detect_collapsed(text: str) -> bool:
     return bool(COLLAPSED_RE.search(text))
 
 
+def _compile_completion_patterns(raw: str | None) -> list[re.Pattern[str]]:
+    """Parse comma-separated regex completion patterns."""
+    if not raw:
+        return []
+    patterns = []
+    for item in raw.split(","):
+        pattern = item.strip()
+        if not pattern:
+            continue
+        patterns.append(re.compile(pattern))
+    return patterns
+
+
+def _run_codex_process(
+    proc: subprocess.Popen,
+    completion_patterns: list[re.Pattern[str]],
+    working_directory: str | None = None,
+) -> dict:
+    """Run a Codex process with startup prompt handling and structured completion."""
+    started = datetime.now(timezone.utc)
+    startup_handled = False
+    startup_prompt_seen = False
+    completion_match: str | None = None
+    output_length = 0
+
+    stdout = proc.stdout
+    if stdout is None:
+        raise RuntimeError("Failed to capture subprocess stdout")
+
+    while True:
+        line = stdout.readline()
+        if line:
+            print(line, end="", flush=True)
+            output_length += len(line)
+            if not startup_handled and detect_codex_startup_prompt(line):
+                startup_prompt_seen = True
+                startup_handled = True
+                if working_directory and not _is_codex_trusted(working_directory):
+                    _add_codex_trusted_directory(working_directory)
+                if proc.stdin is not None:
+                    proc.stdin.write("y\n")
+                    proc.stdin.flush()
+                print("[agentnanny] auto-accepted Codex startup prompt", file=sys.stderr)
+                continue
+            for pattern in completion_patterns:
+                if pattern.search(line):
+                    completion_match = pattern.pattern
+                    break
+            continue
+
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+
+    ended = datetime.now(timezone.utc)
+    exit_code = proc.poll()
+    if exit_code is None:
+        exit_code = -1
+
+    completion_status = {
+        "matched": completion_match is not None,
+        "pattern": completion_match,
+        "criteria_count": len(completion_patterns),
+        "criteria": [p.pattern for p in completion_patterns],
+    }
+
+    return {
+        "started_at": started.isoformat(timespec="seconds"),
+        "ended_at": ended.isoformat(timespec="seconds"),
+        "return_code": exit_code,
+        "startup_prompt_seen": startup_prompt_seen,
+        "completion": completion_status,
+        "output_length": output_length,
+    }
+
+
+def run_codex_session(
+    command_args: list[str],
+    env: dict[str, str],
+    completion: str | None = None,
+    working_directory: str | None = None,
+) -> dict:
+    """Run a Codex command with startup prompt handling and structured result."""
+    proc = subprocess.Popen(
+        command_args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    try:
+        completion_patterns = _compile_completion_patterns(completion)
+        return _run_codex_process(
+            proc,
+            completion_patterns,
+            working_directory=working_directory,
+        )
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stdin is not None:
+            proc.stdin.close()
+        proc.wait()
+
+
 class PaneState:
     """Per-pane state for cooldown tracking."""
     __slots__ = ("last_action_time", "last_content_hash")
