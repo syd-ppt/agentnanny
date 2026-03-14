@@ -1214,8 +1214,57 @@ def _compile_completion_patterns(raw: str | None) -> list[re.Pattern[str]]:
     return patterns
 
 
+class _CodexRunnerBackend:
+    """Backend interface for interactive Codex sessions."""
+
+    def readline(self) -> str:
+        raise NotImplementedError
+
+    def write(self, value: str) -> None:
+        raise NotImplementedError
+
+    def poll(self) -> int | None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def wait(self) -> int:
+        raise NotImplementedError
+
+
+class _SubprocessCodexBackend(_CodexRunnerBackend):
+    """Codex backend backed by subprocess.Popen."""
+
+    def __init__(self, proc: subprocess.Popen):
+        self._proc = proc
+
+    def readline(self) -> str:
+        if self._proc.stdout is None:
+            return ""
+        return self._proc.stdout.readline()
+
+    def write(self, value: str) -> None:
+        if self._proc.stdin is None:
+            return
+        self._proc.stdin.write(value)
+        self._proc.stdin.flush()
+
+    def poll(self) -> int | None:
+        return self._proc.poll()
+
+    def close(self) -> None:
+        if self._proc.stdout is not None:
+            self._proc.stdout.close()
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+
+    def wait(self) -> int:
+        return self._proc.wait()
+
+
 def _run_codex_process(
-    proc: subprocess.Popen,
+    backend: _CodexRunnerBackend,
     completion_patterns: list[re.Pattern[str]],
     working_directory: str | None = None,
 ) -> dict:
@@ -1226,12 +1275,8 @@ def _run_codex_process(
     completion_match: str | None = None
     output_length = 0
 
-    stdout = proc.stdout
-    if stdout is None:
-        raise RuntimeError("Failed to capture subprocess stdout")
-
     while True:
-        line = stdout.readline()
+        line = backend.readline()
         if line:
             print(line, end="", flush=True)
             output_length += len(line)
@@ -1240,9 +1285,7 @@ def _run_codex_process(
                 startup_handled = True
                 if working_directory and not _is_codex_trusted(working_directory):
                     _add_codex_trusted_directory(working_directory)
-                if proc.stdin is not None:
-                    proc.stdin.write("y\n")
-                    proc.stdin.flush()
+                backend.write("y\n")
                 print("[agentnanny] auto-accepted Codex startup prompt", file=sys.stderr)
                 continue
             for pattern in completion_patterns:
@@ -1251,12 +1294,12 @@ def _run_codex_process(
                     break
             continue
 
-        if proc.poll() is not None:
+        if backend.poll() is not None:
             break
         time.sleep(0.05)
 
     ended = datetime.now(timezone.utc)
-    exit_code = proc.poll()
+    exit_code = backend.poll()
     if exit_code is None:
         exit_code = -1
 
@@ -1291,21 +1334,20 @@ def run_codex_session(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        cwd=working_directory,
         env=env,
     )
+    backend = _SubprocessCodexBackend(proc)
     try:
         completion_patterns = _compile_completion_patterns(completion)
         return _run_codex_process(
-            proc,
+            backend,
             completion_patterns,
             working_directory=working_directory,
         )
     finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stdin is not None:
-            proc.stdin.close()
-        proc.wait()
+        backend.close()
+        backend.wait()
 
 
 class PaneState:
@@ -1315,6 +1357,36 @@ class PaneState:
     def __init__(self):
         self.last_action_time: float = 0.0
         self.last_content_hash: int = 0
+
+
+class _InteractiveBackend:
+    """Interactive prompt automation backend."""
+
+    def list_targets(self, target: str | None = None) -> list[str]:
+        raise NotImplementedError
+
+    def capture(self, target: str) -> str:
+        raise NotImplementedError
+
+    def send_keys(self, target: str, keys: str) -> None:
+        raise NotImplementedError
+
+
+class _TmuxBackend(_InteractiveBackend):
+    """tmux-backed prompt automation backend."""
+
+    def __init__(self, session: str, dry_run: bool = False):
+        self._session = session
+        self._dry_run = dry_run
+
+    def list_targets(self, target: str | None = None) -> list[str]:
+        return tmux_list_panes(target or self._session)
+
+    def capture(self, target: str) -> str:
+        return tmux_capture(target)
+
+    def send_keys(self, target: str, keys: str) -> None:
+        tmux_send_keys(target, keys, dry_run=self._dry_run)
 
 
 def tmux_capture(target: str) -> str:
@@ -1357,11 +1429,12 @@ def daemon_loop(session: str, cfg: dict):
     dry_run = bool(daemon_cfg.get("dry_run", False))
 
     pane_states: dict[str, PaneState] = {}
+    backend: _InteractiveBackend = _TmuxBackend(session, dry_run=dry_run)
 
     print(f"agentnanny daemon started — session={session} poll={poll_interval}s cooldown={cooldown}s dry_run={dry_run}")
 
     while True:
-        panes = tmux_list_panes(session)
+        panes = backend.list_targets()
         if not panes:
             time.sleep(poll_interval)
             continue
@@ -1375,7 +1448,7 @@ def daemon_loop(session: str, cfg: dict):
             if now - state.last_action_time < cooldown:
                 continue
 
-            content = tmux_capture(pane)
+            content = backend.capture(pane)
             if not content:
                 continue
 
@@ -1386,7 +1459,7 @@ def daemon_loop(session: str, cfg: dict):
 
             # Check for collapsed transcript first
             if detect_collapsed(content):
-                tmux_send_keys(pane, "C-o", dry_run)
+                backend.send_keys(pane, "C-o")
                 state.last_action_time = now
                 audit_log("daemon", "expanded", "collapsed", f"pane={pane}", cfg)
                 continue
@@ -1399,26 +1472,26 @@ def daemon_loop(session: str, cfg: dict):
             prompt_type, num_options = result
 
             if prompt_type == "continue":
-                tmux_send_keys(pane, "Enter", dry_run)
+                backend.send_keys(pane, "Enter")
                 state.last_action_time = now
                 audit_log("daemon", "approved", "continue", f"pane={pane}", cfg)
             elif prompt_type == "trust":
-                tmux_send_keys(pane, "Enter", dry_run)
+                backend.send_keys(pane, "Enter")
                 state.last_action_time = now
                 audit_log("daemon", "approved", "trust", f"pane={pane}", cfg)
             elif prompt_type == "permission":
                 if num_options >= 3:
                     # 3-option: 1. Yes / 2. Yes, allow for project / 3. No
                     # Cursor starts on 1. Down + Enter → option 2 (allow for project).
-                    tmux_send_keys(pane, "Down", dry_run)
+                    backend.send_keys(pane, "Down")
                     time.sleep(0.05)
-                    tmux_send_keys(pane, "Enter", dry_run)
+                    backend.send_keys(pane, "Enter")
                     state.last_action_time = now
                     audit_log("daemon", "approved", "permission-opt2", f"pane={pane} opts={num_options}", cfg)
                 else:
                     # 2-option: 1. Yes / 2. No (flagged commands)
                     # Cursor on 1. Enter → Yes.
-                    tmux_send_keys(pane, "Enter", dry_run)
+                    backend.send_keys(pane, "Enter")
                     state.last_action_time = now
                     audit_log("daemon", "approved", "permission-opt1", f"pane={pane} opts={num_options}", cfg)
 
@@ -2152,7 +2225,15 @@ def main():
     elif args.command == "extend":
         cmd_extend(args.scope_id, args.groups, args.tools, args.deny)
     elif args.command == "run":
-        cmd_run(args.profile, args.groups, args.tools, args.deny, args.ttl, args.command_args, args.target)
+        cmd_run(
+            args.profile,
+            args.groups,
+            args.tools,
+            args.deny,
+            args.ttl,
+            args.command_args,
+            args.target,
+        )
     elif args.command == "profiles":
         cmd_list_profiles()
     elif args.command == "sessions":

@@ -1746,6 +1746,7 @@ class TestRunWrapper:
         assert result["completion"]["criteria_count"] == 0
         assert result["completion"]["criteria"] == []
         assert result["completion"]["pattern"] is None
+
     def test_run_sets_env_and_cleans_up(self, tmp_path):
         cfg = {"hooks": {}, "groups": {}, "logging": {"audit_log": os.devnull}}
         captured_env = {}
