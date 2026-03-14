@@ -842,6 +842,16 @@ class TestTrustDirectory:
         proj_key = str((tmp_path / "myproject").resolve())
         assert settings["projects"][proj_key]["hasTrustDialogAccepted"] is True
 
+    def test_trust_codex_new_directory(self, tmp_path):
+        trust_file = tmp_path / "trust.json"
+
+        with patch.object(agentnanny, "CODEX_TRUST_PATH", trust_file):
+            agentnanny.trust_directory(str(tmp_path / "myproject"), target="codex")
+
+        settings = json.loads(trust_file.read_text(encoding="utf-8"))
+        expected = str((tmp_path / "myproject").resolve())
+        assert settings == {"trusted_directories": [expected]}
+
     def test_trust_preserves_existing(self, tmp_path):
         claude_json = tmp_path / ".claude.json"
         claude_json.write_text(json.dumps({
@@ -858,6 +868,18 @@ class TestTrustDirectory:
         assert settings["numStartups"] == 5
         assert settings["projects"]["/existing"]["hasTrustDialogAccepted"] is True
 
+    def test_trust_codex_preserves_existing(self, tmp_path):
+        trust_file = tmp_path / "trust.json"
+        trust_file.write_text(json.dumps({
+            "trusted_directories": ["/existing"],
+        }), encoding="utf-8")
+
+        with patch.object(agentnanny, "CODEX_TRUST_PATH", trust_file):
+            agentnanny.trust_directory(str(tmp_path / "newproject"), target="codex")
+
+        settings = json.loads(trust_file.read_text(encoding="utf-8"))
+        assert settings["trusted_directories"] == ["/existing", str((tmp_path / "newproject").resolve())]
+
     def test_trust_creates_file(self, tmp_path):
         claude_json = tmp_path / ".claude.json"
 
@@ -865,6 +887,11 @@ class TestTrustDirectory:
             agentnanny.trust_directory(str(tmp_path))
 
         assert claude_json.exists()
+
+    def test_trust_invalid_target(self, tmp_path):
+        with patch.object(agentnanny, "CODEX_TRUST_PATH", tmp_path / "trust.json"):
+            with pytest.raises(ValueError, match="Unsupported trust target"):
+                agentnanny.trust_directory(str(tmp_path), target="unknown")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

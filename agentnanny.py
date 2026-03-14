@@ -34,6 +34,7 @@ SESSION_DIR = Path(tempfile.gettempdir()) / "agentnanny" / "sessions"
 # Codex CLI paths
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 CODEX_CONFIG_PATH = CODEX_HOME / "config.toml"
+CODEX_TRUST_PATH = CODEX_HOME / "trust.json"
 
 # Supported targets
 TARGETS = ("claude", "codex")
@@ -984,6 +985,77 @@ def trust_directory(directory: str):
     print(f"Trusted: {abs_dir}")
 
 
+def _load_codex_trusts() -> dict[str, dict]:
+    """Load Codex trust metadata from CODEX_TRUST_PATH."""
+    if not CODEX_TRUST_PATH.exists():
+        return {"trusted_directories": []}
+    try:
+        data = json.loads(CODEX_TRUST_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("trusted_directories"), list):
+            return data
+    except (json.JSONDecodeError, OSError):
+        return {"trusted_directories": []}
+    return {"trusted_directories": []}
+
+
+def _write_codex_trusts(data: dict) -> None:
+    """Persist Codex trust metadata with owner-only permissions."""
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    tmp = CODEX_TRUST_PATH.with_suffix(".tmp")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(str(tmp), CODEX_TRUST_PATH)
+
+
+def _add_codex_trusted_directory(directory: str) -> str:
+    """Add a directory to Codex trust metadata and return the canonical path."""
+    abs_dir = str(Path(directory).resolve())
+    data = _load_codex_trusts()
+    trusted = data.get("trusted_directories", [])
+    if abs_dir not in trusted:
+        trusted.append(abs_dir)
+        trusted.sort()
+    data["trusted_directories"] = trusted
+    _write_codex_trusts(data)
+    return abs_dir
+
+
+def _is_codex_trusted(directory: str) -> bool:
+    """Return True if the directory is in Codex trust metadata."""
+    abs_dir = str(Path(directory).resolve())
+    return abs_dir in _load_codex_trusts().get("trusted_directories", [])
+
+
+def trust_directory(directory: str, target: str = "claude"):
+    """Trust directory for Claude or Codex."""
+    if target == "claude":
+        abs_dir = str(Path(directory).resolve())
+        settings: dict = {}
+        if CLAUDE_JSON_PATH.exists():
+            settings = json.loads(CLAUDE_JSON_PATH.read_text(encoding="utf-8"))
+
+        projects = settings.setdefault("projects", {})
+        proj = projects.setdefault(abs_dir, {})
+        proj["hasTrustDialogAccepted"] = True
+
+        CLAUDE_JSON_PATH.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        print(f"Trusted: {abs_dir}")
+        return
+
+    if target == "codex":
+        abs_dir = _add_codex_trusted_directory(directory)
+        print(f"Trusted for Codex: {abs_dir}")
+        return
+
+    raise ValueError(f"Unsupported trust target: {target}")
+
+
 # ---------------------------------------------------------------------------
 # Mode 3: tmux daemon (WSL/headless only)
 # ---------------------------------------------------------------------------
@@ -1864,6 +1936,7 @@ def main():
 
     p_trust = sub.add_parser("trust", help="Pre-trust a directory")
     p_trust.add_argument("directory", nargs="?", default=".", help="Directory to trust (default: .)")
+    p_trust.add_argument("--target", choices=TARGETS, default="claude", help="Target agent (default: claude)")
 
     p_watch = sub.add_parser("watch", help="Start tmux daemon (WSL only)")
     p_watch.add_argument("session", nargs="?", help="tmux session name")
@@ -1939,7 +2012,7 @@ def main():
         else:
             uninstall_hooks()
     elif args.command == "trust":
-        trust_directory(args.directory)
+        trust_directory(args.directory, args.target)
     elif args.command == "watch":
         start_daemon(args.session)
     elif args.command == "stop":
